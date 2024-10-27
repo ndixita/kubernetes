@@ -5756,7 +5756,7 @@ func TestAlphaLocalStorageCapacityIsolation(t *testing.T) {
 				resource.BinarySI),
 		},
 	}
-	if errs := ValidateResourceRequirements(&containerLimitCase, nil, field.NewPath("resources"), PodValidationOptions{}); len(errs) != 0 {
+	if errs := ValidateResourceRequirements(&containerLimitCase, nil, field.NewPath("resources"), ResourceValidationOptions{}); len(errs) != 0 {
 		t.Errorf("expected success: %v", errs)
 	}
 }
@@ -18619,6 +18619,251 @@ func TestValidateServiceUpdate(t *testing.T) {
 	}
 }
 
+func TestValidatePodResourceConsistency(t *testing.T) {
+	path := field.NewPath("resources")
+	tests := []struct {
+		name            string
+		podResources    core.ResourceRequirements
+		containers      []core.Container
+		expectedFailure bool
+	}{{
+		name: "effective container requests less than pod requests",
+		podResources: core.ResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("4"),
+						core.ResourceMemory: resource.MustParse("3Mi"),
+					},
+				},
+			},
+		},
+		expectedFailure: false,
+	}, {
+		name: "effective container requests equal to pod requests",
+		podResources: core.ResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			},
+		},
+		expectedFailure: false,
+	}, {
+		name: "effective container requests greater than pod requests",
+		podResources: core.ResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("6"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("8"),
+						core.ResourceMemory: resource.MustParse("3Mi"),
+					},
+				},
+			},
+		},
+		expectedFailure: true,
+	}, {
+		name: "effective container limits less than pod limits",
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("4"),
+						core.ResourceMemory: resource.MustParse("3Mi"),
+					},
+				},
+			},
+		},
+		expectedFailure: false,
+	}, {
+		name: "effective container limits equal to pod limits",
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			},
+		},
+		expectedFailure: false,
+	}, {
+		name: "effective container limits greater than pod limits",
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("6"),
+						core.ResourceMemory: resource.MustParse("9Mi"),
+					},
+				},
+			},
+		},
+		expectedFailure: false,
+	}, {
+		name: "indivdual container limits greater than pod limits",
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("11"),
+						core.ResourceMemory: resource.MustParse("12Mi"),
+					},
+				},
+			},
+		},
+		expectedFailure: true,
+	},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := core.PodSpec{
+				Resources:  &tc.podResources,
+				Containers: tc.containers,
+			}
+			errs := validatePodResourceConsistency(&spec, path)
+			if tc.expectedFailure && (len(errs) == 0) {
+				t.Errorf("expected: failures, got: no failures")
+			}
+			if !tc.expectedFailure && (len(errs) != 0) {
+				t.Errorf("expected: no failures, got errors: %v", errs)
+			}
+		})
+	}
+}
+
+func TestValidatePodResourceNames(t *testing.T) {
+	table := []struct {
+		input           core.ResourceName
+		expectedFailure bool
+	}{
+		{"memory", false},
+		{"cpu", false},
+		{"storage", true},
+		{"requests.cpu", true},
+		{"requests.memory", true},
+		{"requests.storage", true},
+		{"limits.cpu", true},
+		{"limits.memory", true},
+		{"limits.storage", true},
+		{"network", true},
+		{"disk", true},
+		{"", true},
+		{".", true},
+		{"..", true},
+		{"my.favorite.app.co/12345", true},
+		{"my.favorite.app.co/_12345", true},
+		{"my.favorite.app.co/12345_", true},
+		{"kubernetes.io/..", true},
+		{core.ResourceName("kubernetes.io/" + strings.Repeat("a", 64)), true},
+		{core.ResourceName("kubernetes.io/" + strings.Repeat("a", 64)), true},
+		{core.ResourceName("kubernetes.io/" + core.ResourceCPU), false},
+		{core.ResourceName("kubernetes.io/" + core.ResourceMemory), false},
+		{"kubernetes.io//", true},
+		{"kubernetes.io", true},
+		{"kubernetes.io/will/not/work/", true},
+	}
+	for _, item := range table {
+		errs := validatePodResourceName(item.input, field.NewPath("field"))
+		if len(errs) != 0 && !item.expectedFailure {
+			t.Errorf("expected no failure for input %q, got: %v", item.input, errs)
+		}
+
+		if len(errs) == 0 && item.expectedFailure {
+			t.Errorf("expected failure for input %q", item.input)
+		}
+	}
+}
+
 func TestValidateResourceNames(t *testing.T) {
 	table := []struct {
 		input   core.ResourceName
@@ -18649,7 +18894,7 @@ func TestValidateResourceNames(t *testing.T) {
 		{"kubernetes.io/will/not/work/", false, ""},
 	}
 	for k, item := range table {
-		err := validateResourceName(item.input, field.NewPath("field"))
+		err := validateComputeResourceName(item.input, field.NewPath("field"))
 		if len(err) != 0 && item.success {
 			t.Errorf("expected no failure for input %q", item.input)
 		} else if len(err) == 0 && !item.success {
@@ -23037,7 +23282,7 @@ func TestValidateResourceRequirements(t *testing.T) {
 	tests := []struct {
 		name         string
 		requirements core.ResourceRequirements
-		opts         PodValidationOptions
+		opts         ResourceValidationOptions
 	}{{
 		name: "limits and requests of hugepage resource are equal",
 		requirements: core.ResourceRequirements{
@@ -23050,7 +23295,7 @@ func TestValidateResourceRequirements(t *testing.T) {
 				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("2Mi"),
 			},
 		},
-		opts: PodValidationOptions{},
+		opts: ResourceValidationOptions{},
 	}, {
 		name: "limits and requests of memory resource are equal",
 		requirements: core.ResourceRequirements{
@@ -23061,7 +23306,7 @@ func TestValidateResourceRequirements(t *testing.T) {
 				core.ResourceMemory: resource.MustParse("2Mi"),
 			},
 		},
-		opts: PodValidationOptions{},
+		opts: ResourceValidationOptions{},
 	}, {
 		name: "limits and requests of cpu resource are equal",
 		requirements: core.ResourceRequirements{
@@ -23072,7 +23317,18 @@ func TestValidateResourceRequirements(t *testing.T) {
 				core.ResourceCPU: resource.MustParse("10"),
 			},
 		},
-		opts: PodValidationOptions{},
+		opts: ResourceValidationOptions{},
+	}, {
+		name: "pod resource with supported native resources",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName("kubernetes.io/cpu"): resource.MustParse("2"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName("kubernetes.io/cpu"): resource.MustParse("2"),
+			},
+		},
+		opts: ResourceValidationOptions{PodLevelResource: true},
 	},
 	}
 
@@ -23087,7 +23343,7 @@ func TestValidateResourceRequirements(t *testing.T) {
 	errTests := []struct {
 		name         string
 		requirements core.ResourceRequirements
-		opts         PodValidationOptions
+		opts         ResourceValidationOptions
 	}{{
 		name: "hugepage resource without cpu or memory",
 		requirements: core.ResourceRequirements{
@@ -23098,8 +23354,64 @@ func TestValidateResourceRequirements(t *testing.T) {
 				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("2Mi"),
 			},
 		},
-		opts: PodValidationOptions{},
+		opts: ResourceValidationOptions{},
+	}, {
+		name: "pod resource with hugepages",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("2Mi"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("2Mi"),
+			},
+		},
+		opts: ResourceValidationOptions{PodLevelResource: true},
+	}, {
+		name: "pod resource with ephemeral-storage",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName(core.ResourceEphemeralStorage): resource.MustParse("2Mi"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName(core.ResourceEphemeralStorage + "2Mi"): resource.MustParse("2Mi"),
+			},
+		},
+		opts: ResourceValidationOptions{PodLevelResource: true},
+	}, {
+		name: "pod resource with unsupported prefixed resources",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName("kubernetesio/" + core.ResourceCPU): resource.MustParse("2"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName("kubernetesio/" + core.ResourceMemory): resource.MustParse("2"),
+			},
+		},
+		opts: ResourceValidationOptions{PodLevelResource: true},
+	}, {
+		name: "pod resource with unsupported native resources",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName("kubernetes.io/" + strings.Repeat("a", 63)): resource.MustParse("2"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName("kubernetes.io/" + strings.Repeat("a", 63)): resource.MustParse("2"),
+			},
+		},
+		opts: ResourceValidationOptions{PodLevelResource: true},
 	},
+		{
+			name: "pod resource with unsupported empty native resource name",
+			requirements: core.ResourceRequirements{
+				Limits: core.ResourceList{
+					core.ResourceName("kubernetes.io/"): resource.MustParse("2"),
+				},
+				Requests: core.ResourceList{
+					core.ResourceName("kubernetes.io"): resource.MustParse("2"),
+				},
+			},
+			opts: ResourceValidationOptions{PodLevelResource: true},
+		},
 	}
 
 	for _, tc := range errTests {
