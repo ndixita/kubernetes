@@ -83,7 +83,7 @@ func isPodLevelRequestsSet(pod *v1.Pod, podLevelResourcesenabled bool) bool {
 func PodRequests(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 	// attempt to reuse the maps if passed, or allocate otherwise
 	reqs := reuseOrClearResourceList(opts.Reuse)
-	effectiveContainerReqs := effectiveContainersRequests(pod, opts)
+	effectiveContainersReqs := effectiveContainersRequests(pod, opts)
 	if !opts.UseContainerLevelResources && isPodLevelRequestsSet(pod, opts.PodLevelResourcesEnabled) {
 		podRequests := v1.ResourceList{}
 		for resourceName, quantity := range pod.Spec.Resources.Requests {
@@ -95,14 +95,14 @@ func PodRequests(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 		// Total pod resource requests are calculated using the effective container
 		// requests when resources are not specified at pod-level or when resources
 		// are not supported by PodLevelResource feature
-		for resourceName, quantity := range effectiveContainerReqs {
+		for resourceName, quantity := range effectiveContainersReqs {
 			if _, exists := podRequests[resourceName]; !exists {
 				podRequests[resourceName] = quantity
 			}
 		}
 		addResourceList(reqs, podRequests)
 	} else {
-		addResourceList(reqs, effectiveContainerReqs)
+		addResourceList(reqs, effectiveContainersReqs)
 	}
 
 	// Add overhead for running a pod to the sum of requests if requested:
@@ -214,7 +214,47 @@ func applyNonMissing(reqs v1.ResourceList, nonMissing v1.ResourceList) v1.Resour
 func PodLimits(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 	// attempt to reuse the maps if passed, or allocate otherwise
 	limits := reuseOrClearResourceList(opts.Reuse)
+	effectiveContainersLims := effectiveContainersLimits(pod, opts)
+	if isPodLevelRequestsSet(pod, opts.PodLevelResourcesEnabled) {
+		podLimits := v1.ResourceList{}
+		for resourceName, quantity := range pod.Spec.Resources.Limits {
+			if IsSupportedPodLevelResource(resourceName) {
+				podLimits[resourceName] = quantity
+			}
+		}
 
+		// Total pod resource requests are calculated using the effective container
+		// requests when resources are not specified at pod-level or when resources
+		// are not supported by PodLevelResource feature
+		for resourceName, quantity := range effectiveContainersLims {
+			if _, exists := podLimits[resourceName]; !exists {
+				podLimits[resourceName] = quantity
+			}
+		}
+		addResourceList(limits, podLimits)
+	} else {
+		addResourceList(limits, effectiveContainersLims)
+	}
+
+	// Add overhead to non-zero limits if requested:
+	if !opts.ExcludeOverhead && pod.Spec.Overhead != nil {
+		for name, quantity := range pod.Spec.Overhead {
+			if value, ok := limits[name]; ok && !value.IsZero() {
+				value.Add(quantity)
+				limits[name] = value
+			}
+		}
+	}
+
+	return limits
+}
+
+// effectiveContainersLimits computes the effective resource limits of all the containers
+// in a pod. This computation folows the formula defined in the KEP for sidecar
+// containers. See https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/753-sidecar-containers#resources-calculation-for-scheduling-and-pod-admission
+// for more details.
+func effectiveContainersLimits(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
+	limits := v1.ResourceList{}
 	for _, container := range pod.Spec.Containers {
 		if opts.ContainerFn != nil {
 			opts.ContainerFn(container.Resources.Limits, Containers)
@@ -254,17 +294,6 @@ func PodLimits(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 	}
 
 	maxResourceList(limits, initContainerLimits)
-
-	// Add overhead to non-zero limits if requested:
-	if !opts.ExcludeOverhead && pod.Spec.Overhead != nil {
-		for name, quantity := range pod.Spec.Overhead {
-			if value, ok := limits[name]; ok && !value.IsZero() {
-				value.Add(quantity)
-				limits[name] = value
-			}
-		}
-	}
-
 	return limits
 }
 
