@@ -71,7 +71,7 @@ func IsPodLevelResourcesSet(pod *v1.Pod, podLevelResourcesEnabled bool) bool {
 
 // IsPodLevelResourcesSet check if PodLevelResources feature is enabled and
 // pod-level requests are set.
-func isPodLevelRequestsSet(pod *v1.Pod, podLevelResourcesenabled bool) bool {
+func IsPodLevelRequestsSet(pod *v1.Pod, podLevelResourcesenabled bool) bool {
 	return IsPodLevelResourcesSet(pod, podLevelResourcesenabled) && pod.Spec.Resources.Requests != nil
 }
 
@@ -84,7 +84,7 @@ func PodRequests(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 	// attempt to reuse the maps if passed, or allocate otherwise
 	reqs := reuseOrClearResourceList(opts.Reuse)
 	effectiveContainersReqs := effectiveContainersRequests(pod, opts)
-	if !opts.UseContainerLevelResources && isPodLevelRequestsSet(pod, opts.PodLevelResourcesEnabled) {
+	if !opts.UseContainerLevelResources && IsPodLevelRequestsSet(pod, opts.PodLevelResourcesEnabled) {
 		podRequests := v1.ResourceList{}
 		for resourceName, quantity := range pod.Spec.Resources.Requests {
 			if IsSupportedPodLevelResource(resourceName) {
@@ -215,7 +215,7 @@ func PodLimits(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 	// attempt to reuse the maps if passed, or allocate otherwise
 	limits := reuseOrClearResourceList(opts.Reuse)
 	effectiveContainersLims := effectiveContainersLimits(pod, opts)
-	if isPodLevelRequestsSet(pod, opts.PodLevelResourcesEnabled) {
+	if IsPodLevelRequestsSet(pod, opts.PodLevelResourcesEnabled) {
 		podLimits := v1.ResourceList{}
 		for resourceName, quantity := range pod.Spec.Resources.Limits {
 			if IsSupportedPodLevelResource(resourceName) {

@@ -27,6 +27,7 @@ package qos // import "k8s.io/kubernetes/pkg/kubelet/qos"
 
 import (
 	v1 "k8s.io/api/core/v1"
+	resourcehelper "k8s.io/component-helpers/resource"
 )
 
 // minRegularContainerMemory returns the minimum memory resource quantity
@@ -40,4 +41,35 @@ func minRegularContainerMemory(pod v1.Pod) int64 {
 		}
 	}
 	return memoryValue
+}
+
+// remainingPodMemReqPerContainer calculates the remaining pod memory request per
+// container by:
+// 1. Taking the total pod memory requests
+// 2. Subtracting total container memory requests from pod memory requests
+// 3. Dividing the remainder by the number of containers.
+// This gives us the additional memory request that is not allocated to any
+// containers in the pod. This value will be divided equally among all containers to
+// calculate oom score adjusment.
+// See https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/2837-pod-level-resource-spec/README.md#oom-score-adjustment
+// for more details.
+func remainingPodMemReqPerContainer(pod *v1.Pod) int64 {
+	var remainingMemory int64
+	if pod.Spec.Resources.Requests.Memory() == nil || pod.Spec.Resources.Requests.Memory().Value() == 0 {
+		return remainingMemory
+	}
+
+	numContainers := len(pod.Spec.Containers) + len(pod.Spec.InitContainers)
+
+	// Aggregated requests of all containers.
+	totalContainersReq := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{
+		InPlacePodVerticalScalingEnabled: true,
+		UseContainerLevelResources:       true,
+		ExcludeOverhead:                  true,
+	})
+
+	remainingMemory = pod.Spec.Resources.Requests.Memory().Value() - totalContainersReq.Memory().Value()
+
+	remainingMemoryPerContainer := remainingMemory / int64(numContainers)
+	return remainingMemoryPerContainer
 }
