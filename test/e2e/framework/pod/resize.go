@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -301,20 +300,7 @@ func VerifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 		cgroupCPULimit = CgroupCPUQuota
 		cgroupCPURequest = CgroupCPUShares
 	}
-	verifyCgroupValue := func(cName, cgPath, expectedCgValue string) error {
-		cmd := fmt.Sprintf("head -n 1 %s", cgPath)
-		framework.Logf("Namespace %s Pod %s Container %s - looking for cgroup value %s in path %s",
-			pod.Namespace, pod.Name, cName, expectedCgValue, cgPath)
-		cgValue, _, err := ExecCommandInContainerWithFullOutput(f, pod.Name, cName, "/bin/sh", "-c", cmd)
-		if err != nil {
-			return fmt.Errorf("failed to find expected value %q in container cgroup %q", expectedCgValue, cgPath)
-		}
-		cgValue = strings.Trim(cgValue, "\n")
-		if cgValue != expectedCgValue {
-			return fmt.Errorf("cgroup value %q not equal to expected %q", cgValue, expectedCgValue)
-		}
-		return nil
-	}
+
 	for _, ci := range tcInfo {
 		if ci.Resources == nil {
 			continue
@@ -350,16 +336,16 @@ func VerifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 				expectedCPUShares = int64(1 + ((expectedCPUShares-2)*9999)/262142)
 			}
 			if expectedMemLimitString != "0" {
-				err := verifyCgroupValue(ci.Name, cgroupMemLimit, expectedMemLimitString)
+				err := VerifyCgroupValue(f, pod, ci.Name, cgroupMemLimit, expectedMemLimitString)
 				if err != nil {
 					return err
 				}
 			}
-			err := verifyCgroupValue(ci.Name, cgroupCPULimit, expectedCPULimitString)
+			err := VerifyCgroupValue(f, pod, ci.Name, cgroupCPULimit, expectedCPULimitString)
 			if err != nil {
 				return err
 			}
-			err = verifyCgroupValue(ci.Name, cgroupCPURequest, strconv.FormatInt(expectedCPUShares, 10))
+			err = VerifyCgroupValue(f, pod, ci.Name, cgroupCPURequest, strconv.FormatInt(expectedCPUShares, 10))
 			if err != nil {
 				return err
 			}

@@ -19,11 +19,13 @@ package pod
 import (
 	"flag"
 	"fmt"
+	"strings"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/kubernetes/test/e2e/framework"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	psaapi "k8s.io/pod-security-admission/api"
 	psapolicy "k8s.io/pod-security-admission/policy"
@@ -272,6 +274,21 @@ func FindContainerStatusInPod(pod *v1.Pod, containerName string) *v1.ContainerSt
 		if containerStatus.Name == containerName {
 			return &containerStatus
 		}
+	}
+	return nil
+}
+
+func VerifyCgroupValue(f *framework.Framework, pod *v1.Pod, cName, cgPath, expectedCgValue string) error {
+	cmd := fmt.Sprintf("head -n 1 %s", cgPath)
+	framework.Logf("Namespace %s Pod %s Container %s - looking for cgroup value %s in path %s",
+		pod.Namespace, pod.Name, cName, expectedCgValue, cgPath)
+	cgValue, _, err := ExecCommandInContainerWithFullOutput(f, pod.Name, cName, "/bin/sh", "-c", cmd)
+	if err != nil {
+		return fmt.Errorf("failed to find expected value %q in container cgroup %q", expectedCgValue, cgPath)
+	}
+	cgValue = strings.Trim(cgValue, "\n")
+	if cgValue != expectedCgValue {
+		return fmt.Errorf("cgroup value %q not equal to expected %q", cgValue, expectedCgValue)
 	}
 	return nil
 }
