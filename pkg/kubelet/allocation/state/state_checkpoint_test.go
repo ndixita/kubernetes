@@ -25,7 +25,6 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 )
 
@@ -33,7 +32,7 @@ const testCheckpoint = "pod_status_manager_state"
 
 func newTestStateCheckpoint(t *testing.T) *stateCheckpoint {
 	testingDir := getTestDir(t)
-	cache := NewStateMemory(PodResourceAllocation{})
+	cache := NewStateMemory(PodResourceInfoMap{})
 	checkpointManager, err := checkpointmanager.NewCheckpointManager(testingDir)
 	require.NoError(t, err, "failed to create checkpoint manager")
 	checkpointName := "pod_state_checkpoint"
@@ -56,12 +55,12 @@ func getTestDir(t *testing.T) string {
 	return testingDir
 }
 
-func verifyPodResourceAllocation(t *testing.T, expected, actual *PodResourceAllocation, msgAndArgs string) {
-	for podUID, containerResourceList := range *expected {
-		require.Equal(t, len(containerResourceList), len((*actual)[podUID]), msgAndArgs)
-		for containerName, resourceList := range containerResourceList {
+func verifyPodResourceAllocation(t *testing.T, expected, actual *PodResourceInfoMap, msgAndArgs string) {
+	for podUID, podInfo := range *expected {
+		require.Equal(t, len(podInfo.ContainerResources), len((*actual)[podUID].ContainerResources), msgAndArgs)
+		for containerName, resourceList := range podInfo.ContainerResources {
 			for name, quantity := range resourceList.Requests {
-				require.True(t, quantity.Equal((*actual)[podUID][containerName].Requests[name]), msgAndArgs)
+				require.True(t, quantity.Equal((*actual)[podUID].ContainerResources[containerName].Requests[name]), msgAndArgs)
 			}
 		}
 	}
@@ -69,7 +68,7 @@ func verifyPodResourceAllocation(t *testing.T, expected, actual *PodResourceAllo
 
 func Test_stateCheckpoint_storeState(t *testing.T) {
 	type args struct {
-		podResourceAllocation PodResourceAllocation
+		podResourceInfo PodResourceInfoMap
 	}
 
 	tests := []struct {
@@ -91,12 +90,14 @@ func Test_stateCheckpoint_storeState(t *testing.T) {
 			}{
 				name: fmt.Sprintf("resource - %s%s", fact, suf),
 				args: args{
-					podResourceAllocation: PodResourceAllocation{
-						"pod1": {
-							"container1": {
-								Requests: v1.ResourceList{
-									v1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%s%s", fact, suf)),
-									v1.ResourceMemory: resource.MustParse(fmt.Sprintf("%s%s", fact, suf)),
+					podResourceInfo: PodResourceInfoMap{
+						"pod1": PodResourceInfo{
+							ContainerResources: map[string]v1.ResourceRequirements{
+								"container1": {
+									Requests: v1.ResourceList{
+										v1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%s%s", fact, suf)),
+										v1.ResourceMemory: resource.MustParse(fmt.Sprintf("%s%s", fact, suf)),
+									},
 								},
 							},
 						},
@@ -111,19 +112,19 @@ func Test_stateCheckpoint_storeState(t *testing.T) {
 			originalSC, err := NewStateCheckpoint(testDir, testCheckpoint)
 			require.NoError(t, err)
 
-			for podUID, alloc := range tt.args.podResourceAllocation {
-				err = originalSC.SetPodResourceAllocation(podUID, alloc)
+			for podUID, alloc := range tt.args.podResourceInfo {
+				err = originalSC.SetPodResourceInfoMap(podUID, alloc)
 				require.NoError(t, err)
 			}
 
-			actual := originalSC.GetPodResourceAllocation()
-			verifyPodResourceAllocation(t, &tt.args.podResourceAllocation, &actual, "stored pod resource allocation is not equal to original pod resource allocation")
+			actual := originalSC.GetPodResourceInfoMap()
+			verifyPodResourceAllocation(t, &tt.args.podResourceInfo, &actual, "stored pod resource allocation is not equal to original pod resource allocation")
 
 			newSC, err := NewStateCheckpoint(testDir, testCheckpoint)
 			require.NoError(t, err)
 
-			actual = newSC.GetPodResourceAllocation()
-			verifyPodResourceAllocation(t, &tt.args.podResourceAllocation, &actual, "restored pod resource allocation is not equal to original pod resource allocation")
+			actual = newSC.GetPodResourceInfoMap()
+			verifyPodResourceAllocation(t, &tt.args.podResourceInfo, &actual, "restored pod resource allocation is not equal to original pod resource allocation")
 		})
 	}
 }
@@ -139,12 +140,14 @@ func Test_stateCheckpoint_formatUpgraded(t *testing.T) {
 	// pretend that the old checkpoint is unaware for the field ResizeStatusEntries
 	const checkpointContent = `{"data":"{\"allocationEntries\":{\"pod1\":{\"container1\":{\"requests\":{\"cpu\":\"1Ki\",\"memory\":\"1Ki\"}}}}}","checksum":1555601526}`
 	expectedPodResourceAllocationInfo := &PodResourceAllocationInfo{
-		AllocationEntries: map[types.UID]map[string]v1.ResourceRequirements{
-			"pod1": {
-				"container1": {
-					Requests: v1.ResourceList{
-						v1.ResourceCPU:    resource.MustParse("1Ki"),
-						v1.ResourceMemory: resource.MustParse("1Ki"),
+		AllocationEntries: PodResourceInfoMap{
+			"pod1": PodResourceInfo{
+				ContainerResources: map[string]v1.ResourceRequirements{
+					"container1": {
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1Ki"),
+							v1.ResourceMemory: resource.MustParse("1Ki"),
+						},
 					},
 				},
 			},

@@ -53,8 +53,11 @@ type Manager interface {
 	// pod, if actuatedContainer is nil).
 	SetActuatedResources(allocatedPod *v1.Pod, actuatedContainer *v1.Container) error
 
-	// GetActuatedResources returns the stored actuated resources for the container, and whether they exist.
-	GetActuatedResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool)
+	// GetActuatedContainerResources returns the stored actuated resources for the container, and whether they exist.
+	GetActuatedContainerResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool)
+
+	// GetActuatedPodLevelResources returns the stored actuated resources at pod-level, and whether they exist.
+	GetActuatedPodLevelResources(podUID types.UID) v1.ResourceRequirements
 
 	// RemovePod removes any stored state for the given pod UID.
 	RemovePod(uid types.UID)
@@ -103,26 +106,39 @@ func NewInMemoryManager() Manager {
 // GetContainerResourceAllocation returns the last checkpointed AllocatedResources values
 // If checkpoint manager has not been initialized, it returns nil, false
 func (m *manager) GetContainerResourceAllocation(podUID types.UID, containerName string) (v1.ResourceRequirements, bool) {
-	return m.allocated.GetContainerResourceAllocation(podUID, containerName)
+	return m.allocated.GetContainerResources(podUID, containerName)
 }
 
 // UpdatePodFromAllocation overwrites the pod spec with the allocation.
 // This function does a deep copy only if updates are needed.
 func (m *manager) UpdatePodFromAllocation(pod *v1.Pod) (*v1.Pod, bool) {
 	// TODO(tallclair): This clones the whole cache, but we only need 1 pod.
-	allocs := m.allocated.GetPodResourceAllocation()
+	allocs := m.allocated.GetPodResourceInfoMap()
 	return updatePodFromAllocation(pod, allocs)
 }
 
-func updatePodFromAllocation(pod *v1.Pod, allocs state.PodResourceAllocation) (*v1.Pod, bool) {
+func updatePodFromAllocation(pod *v1.Pod, allocs state.PodResourceInfoMap) (*v1.Pod, bool) {
 	allocated, found := allocs[pod.UID]
 	if !found {
 		return pod, false
 	}
 
 	updated := false
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) {
+		if !apiequality.Semantic.DeepEqual(pod.Spec.Resources, allocated.PodLevelResources) {
+			// Allocation differs from pod spec, retrieve the allocation
+			if !updated {
+				// If this is the first update to be performed, copy the pod
+				pod = pod.DeepCopy()
+				updated = true
+			}
+			// Update the pod-level resources
+			pod.Spec.Resources = allocated.PodLevelResources.DeepCopy()
+		}
+	}
+
 	containerAlloc := func(c v1.Container) (v1.ResourceRequirements, bool) {
-		if cAlloc, ok := allocated[c.Name]; ok {
+		if cAlloc, ok := allocated.ContainerResources[c.Name]; ok {
 			if !apiequality.Semantic.DeepEqual(c.Resources, cAlloc) {
 				// Allocation differs from pod spec, retrieve the allocation
 				if !updated {
@@ -153,21 +169,26 @@ func updatePodFromAllocation(pod *v1.Pod, allocs state.PodResourceAllocation) (*
 
 // SetAllocatedResources checkpoints the resources allocated to a pod's containers
 func (m *manager) SetAllocatedResources(pod *v1.Pod) error {
-	return m.allocated.SetPodResourceAllocation(pod.UID, allocationFromPod(pod))
+	return m.allocated.SetPodResourceInfoMap(pod.UID, allocationFromPod(pod))
 }
 
-func allocationFromPod(pod *v1.Pod) map[string]v1.ResourceRequirements {
-	podAlloc := make(map[string]v1.ResourceRequirements)
+func allocationFromPod(pod *v1.Pod) state.PodResourceInfo {
+	var podAlloc state.PodResourceInfo
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) {
+		podAlloc.PodLevelResources = *pod.Spec.Resources.DeepCopy()
+	}
+
+	podAlloc.ContainerResources = make(map[string]v1.ResourceRequirements)
 	for _, container := range pod.Spec.Containers {
 		alloc := *container.Resources.DeepCopy()
-		podAlloc[container.Name] = alloc
+		podAlloc.ContainerResources[container.Name] = alloc
 	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.SidecarContainers) {
 		for _, container := range pod.Spec.InitContainers {
 			if podutil.IsRestartableInitContainer(&container) {
 				alloc := *container.Resources.DeepCopy()
-				podAlloc[container.Name] = alloc
+				podAlloc.ContainerResources[container.Name] = alloc
 			}
 		}
 	}
@@ -195,12 +216,16 @@ func (m *manager) RemoveOrphanedPods(remainingPods sets.Set[types.UID]) {
 func (m *manager) SetActuatedResources(allocatedPod *v1.Pod, actuatedContainer *v1.Container) error {
 	if actuatedContainer == nil {
 		alloc := allocationFromPod(allocatedPod)
-		return m.actuated.SetPodResourceAllocation(allocatedPod.UID, alloc)
+		return m.actuated.SetPodResourceInfoMap(allocatedPod.UID, alloc)
 	}
 
-	return m.actuated.SetContainerResourceAllocation(allocatedPod.UID, actuatedContainer.Name, actuatedContainer.Resources)
+	return m.actuated.SetContainerResources(allocatedPod.UID, actuatedContainer.Name, actuatedContainer.Resources)
 }
 
-func (m *manager) GetActuatedResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool) {
-	return m.actuated.GetContainerResourceAllocation(podUID, containerName)
+func (m *manager) GetActuatedContainerResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool) {
+	return m.actuated.GetContainerResources(podUID, containerName)
+}
+
+func (m *manager) GetActuatedPodLevelResources(podUID types.UID) v1.ResourceRequirements {
+	return m.actuated.GetPodLevelResources(podUID)
 }

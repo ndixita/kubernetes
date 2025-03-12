@@ -587,7 +587,7 @@ func (m *kubeGenericRuntimeManager) computePodResizeAction(pod *v1.Pod, containe
 		return true
 	}
 
-	actuatedResources, found := m.allocationManager.GetActuatedResources(pod.UID, container.Name)
+	actuatedResources, found := m.allocationManager.GetActuatedContainerResources(pod.UID, container.Name)
 	if !found {
 		klog.ErrorS(nil, "Missing actuated resource record", "pod", klog.KObj(pod), "container", container.Name)
 		// Proceed with the zero-value actuated resources. For restart NotRequired, this may

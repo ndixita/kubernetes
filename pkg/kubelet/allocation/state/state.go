@@ -22,16 +22,24 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-// PodResourceAllocation type is used in tracking resources allocated to pod's containers
-type PodResourceAllocation map[types.UID]map[string]v1.ResourceRequirements
+type PodResourceInfo struct {
+	ContainerResources map[string]v1.ResourceRequirements
+	PodLevelResources  v1.ResourceRequirements
+}
 
-// Clone returns a copy of PodResourceAllocation
-func (pr PodResourceAllocation) Clone() PodResourceAllocation {
-	prCopy := make(PodResourceAllocation)
-	for pod := range pr {
-		prCopy[pod] = make(map[string]v1.ResourceRequirements)
-		for container, alloc := range pr[pod] {
-			prCopy[pod][container] = *alloc.DeepCopy()
+// PodResourceInfoMap type is used in tracking resources allocated to pod's containers
+type PodResourceInfoMap map[types.UID]PodResourceInfo
+
+// Clone returns a copy of PodResourceInfoMap
+func (pr PodResourceInfoMap) Clone() PodResourceInfoMap {
+	prCopy := make(PodResourceInfoMap)
+	for podUID, podInfo := range pr {
+		prCopy[podUID] = PodResourceInfo{
+			PodLevelResources:  *podInfo.PodLevelResources.DeepCopy(),
+			ContainerResources: make(map[string]v1.ResourceRequirements),
+		}
+		for containerName, containerInfo := range podInfo.ContainerResources {
+			prCopy[podUID].ContainerResources[containerName] = *containerInfo.DeepCopy()
 		}
 	}
 	return prCopy
@@ -39,13 +47,15 @@ func (pr PodResourceAllocation) Clone() PodResourceAllocation {
 
 // Reader interface used to read current pod resource allocation state
 type Reader interface {
-	GetContainerResourceAllocation(podUID types.UID, containerName string) (v1.ResourceRequirements, bool)
-	GetPodResourceAllocation() PodResourceAllocation
+	GetContainerResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool)
+	GetPodLevelResources(podUID types.UID) v1.ResourceRequirements
+	GetPodResourceInfoMap() PodResourceInfoMap
 }
 
 type writer interface {
-	SetContainerResourceAllocation(podUID types.UID, containerName string, alloc v1.ResourceRequirements) error
-	SetPodResourceAllocation(podUID types.UID, alloc map[string]v1.ResourceRequirements) error
+	SetContainerResources(podUID types.UID, containerName string, alloc v1.ResourceRequirements) error
+	SetPodLevelResources(podUID types.UID, alloc v1.ResourceRequirements) error
+	SetPodResourceInfoMap(podUID types.UID, alloc PodResourceInfo) error
 	Delete(podUID types.UID, containerName string) error
 	// RemoveOrphanedPods removes the stored state for any pods not included in the set of remaining pods.
 	RemoveOrphanedPods(remainingPods sets.Set[types.UID])

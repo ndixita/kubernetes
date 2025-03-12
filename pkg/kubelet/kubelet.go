@@ -2964,7 +2964,7 @@ func (kl *Kubelet) isPodResizeInProgress(allocatedPod *v1.Pod, podStatus *kubeco
 				return true
 			}
 
-			actuatedResources, _ := kl.allocationManager.GetActuatedResources(allocatedPod.UID, allocatedContainer.Name)
+			actuatedResources, _ := kl.allocationManager.GetActuatedContainerResources(allocatedPod.UID, allocatedContainer.Name)
 			allocatedResources := allocatedContainer.Resources
 
 			// Memory requests are excluded since they don't need to be actuated.

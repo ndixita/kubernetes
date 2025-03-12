@@ -84,7 +84,7 @@ func restoreState(checkpointManager checkpointmanager.CheckpointManager, checkpo
 
 // saves state to a checkpoint, caller is responsible for locking
 func (sc *stateCheckpoint) storeState() error {
-	podAllocation := sc.cache.GetPodResourceAllocation()
+	podAllocation := sc.cache.GetPodResourceInfoMap()
 
 	checkpoint, err := NewCheckpoint(&PodResourceAllocationInfo{
 		AllocationEntries: podAllocation,
@@ -100,33 +100,46 @@ func (sc *stateCheckpoint) storeState() error {
 	return nil
 }
 
-// GetContainerResourceAllocation returns current resources allocated to a pod's container
-func (sc *stateCheckpoint) GetContainerResourceAllocation(podUID types.UID, containerName string) (v1.ResourceRequirements, bool) {
+// GetContainerResources returns current resources allocated to a pod's container
+func (sc *stateCheckpoint) GetContainerResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool) {
 	sc.mux.RLock()
 	defer sc.mux.RUnlock()
-	return sc.cache.GetContainerResourceAllocation(podUID, containerName)
+	return sc.cache.GetContainerResources(podUID, containerName)
 }
 
-// GetPodResourceAllocation returns current pod resource allocation
-func (sc *stateCheckpoint) GetPodResourceAllocation() PodResourceAllocation {
+func (sc *stateCheckpoint) GetPodLevelResources(podUID types.UID) v1.ResourceRequirements {
 	sc.mux.RLock()
 	defer sc.mux.RUnlock()
-	return sc.cache.GetPodResourceAllocation()
+	return sc.cache.GetPodLevelResources(podUID)
 }
 
-// SetContainerResourceAllocation sets resources allocated to a pod's container
-func (sc *stateCheckpoint) SetContainerResourceAllocation(podUID types.UID, containerName string, alloc v1.ResourceRequirements) error {
+// GetPodResourceInfoMap returns current pod resource allocation
+func (sc *stateCheckpoint) GetPodResourceInfoMap() PodResourceInfoMap {
+	sc.mux.RLock()
+	defer sc.mux.RUnlock()
+	return sc.cache.GetPodResourceInfoMap()
+}
+
+// SetContainerResources sets resources allocated to a pod's container
+func (sc *stateCheckpoint) SetContainerResources(podUID types.UID, containerName string, alloc v1.ResourceRequirements) error {
 	sc.mux.Lock()
 	defer sc.mux.Unlock()
-	sc.cache.SetContainerResourceAllocation(podUID, containerName, alloc)
+	sc.cache.SetContainerResources(podUID, containerName, alloc)
 	return sc.storeState()
 }
 
-// SetPodResourceAllocation sets pod resource allocation
-func (sc *stateCheckpoint) SetPodResourceAllocation(podUID types.UID, alloc map[string]v1.ResourceRequirements) error {
+func (sc *stateCheckpoint) SetPodLevelResources(podUID types.UID, alloc v1.ResourceRequirements) error {
 	sc.mux.Lock()
 	defer sc.mux.Unlock()
-	err := sc.cache.SetPodResourceAllocation(podUID, alloc)
+	sc.cache.SetPodLevelResources(podUID, alloc)
+	return sc.storeState()
+}
+
+// SetPodResourceInfoMap sets pod resource allocation
+func (sc *stateCheckpoint) SetPodResourceInfoMap(podUID types.UID, alloc PodResourceInfo) error {
+	sc.mux.Lock()
+	defer sc.mux.Unlock()
+	err := sc.cache.SetPodResourceInfoMap(podUID, alloc)
 	if err != nil {
 		return err
 	}
@@ -154,19 +167,27 @@ func NewNoopStateCheckpoint() State {
 	return &noopStateCheckpoint{}
 }
 
-func (sc *noopStateCheckpoint) GetContainerResourceAllocation(_ types.UID, _ string) (v1.ResourceRequirements, bool) {
+func (sc *noopStateCheckpoint) GetContainerResources(_ types.UID, _ string) (v1.ResourceRequirements, bool) {
 	return v1.ResourceRequirements{}, false
 }
 
-func (sc *noopStateCheckpoint) GetPodResourceAllocation() PodResourceAllocation {
+func (sc *noopStateCheckpoint) GetPodLevelResources(_ types.UID) v1.ResourceRequirements {
+	return v1.ResourceRequirements{}
+}
+
+func (sc *noopStateCheckpoint) GetPodResourceInfoMap() PodResourceInfoMap {
 	return nil
 }
 
-func (sc *noopStateCheckpoint) SetContainerResourceAllocation(_ types.UID, _ string, _ v1.ResourceRequirements) error {
+func (sc *noopStateCheckpoint) SetContainerResources(_ types.UID, _ string, _ v1.ResourceRequirements) error {
 	return nil
 }
 
-func (sc *noopStateCheckpoint) SetPodResourceAllocation(_ types.UID, _ map[string]v1.ResourceRequirements) error {
+func (sc *noopStateCheckpoint) SetPodLevelResources(_ types.UID, _ v1.ResourceRequirements) error {
+	return nil
+}
+
+func (sc *noopStateCheckpoint) SetPodResourceInfoMap(_ types.UID, _ PodResourceInfo) error {
 	return nil
 }
 
