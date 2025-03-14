@@ -54,7 +54,10 @@ type Manager interface {
 	SetActuatedResources(allocatedPod *v1.Pod, actuatedContainer *v1.Container) error
 
 	// GetActuatedResources returns the stored actuated resources for the container, and whether they exist.
-	GetActuatedResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool)
+	GetActuatedContainerResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool)
+
+	// GetActuatedPodLevelResources returns the stored actuated resources for the container, and whether they exist.
+	GetActuatedPodLevelResources(podUID types.UID) (v1.ResourceRequirements, bool)
 
 	// RemovePod removes any stored state for the given pod UID.
 	RemovePod(uid types.UID)
@@ -121,6 +124,18 @@ func updatePodFromAllocation(pod *v1.Pod, allocs state.PodResourceInfoMap) (*v1.
 	}
 
 	updated := false
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) {
+		pAlloc := allocated.PodLevelResources
+		if !apiequality.Semantic.DeepEqual(pod.Spec.Resources, pAlloc) {
+			if !updated {
+				pod = pod.DeepCopy()
+				updated = true
+			}
+			pod.Spec.Resources = &pAlloc
+		}
+	}
+
 	containerAlloc := func(c v1.Container) (v1.ResourceRequirements, bool) {
 		if cAlloc, ok := allocated.ContainerResources[c.Name]; ok {
 			if !apiequality.Semantic.DeepEqual(c.Resources, cAlloc) {
@@ -202,6 +217,10 @@ func (m *manager) SetActuatedResources(allocatedPod *v1.Pod, actuatedContainer *
 	return m.actuated.SetContainerResources(allocatedPod.UID, actuatedContainer.Name, actuatedContainer.Resources)
 }
 
-func (m *manager) GetActuatedResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool) {
+func (m *manager) GetActuatedContainerResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool) {
 	return m.actuated.GetContainerResources(podUID, containerName)
+}
+
+func (m *manager) GetActuatedPodLevelResources(podUID types.UID) (v1.ResourceRequirements, bool) {
+	return m.actuated.GetPodLevelResources(podUID)
 }

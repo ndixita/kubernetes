@@ -5586,16 +5586,6 @@ func ValidatePodResize(newPod, oldPod *core.Pod, opts PodValidationOptions) fiel
 	allErrs := ValidateObjectMetaUpdate(&newPod.ObjectMeta, &oldPod.ObjectMeta, fldPath)
 	allErrs = append(allErrs, validatePodMetadataAndSpec(newPod, opts)...)
 
-	// pods with pod-level resources cannot be resized
-	isPodLevelResourcesSet := func(pod *core.Pod) bool {
-		return pod.Spec.Resources != nil &&
-			(len(pod.Spec.Resources.Requests)+len(pod.Spec.Resources.Limits) > 0)
-	}
-
-	if isPodLevelResourcesSet(oldPod) || isPodLevelResourcesSet(newPod) {
-		return field.ErrorList{field.Forbidden(field.NewPath(""), "pods with pod-level resources cannot be resized")}
-	}
-
 	// static pods cannot be resized.
 	if _, ok := oldPod.Annotations[core.MirrorPodAnnotationKey]; ok {
 		return field.ErrorList{field.Forbidden(field.NewPath(""), "static pods cannot be resized")}

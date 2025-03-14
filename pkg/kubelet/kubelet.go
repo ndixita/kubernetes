@@ -2972,6 +2972,20 @@ func (kl *Kubelet) handlePodResourcesResize(pod *v1.Pod, podStatus *kubecontaine
 // - Non-actuated resources: memory requests are not actuated
 // - Non-running containers: they will be sized correctly when (re)started
 func (kl *Kubelet) isPodResizeInProgress(allocatedPod *v1.Pod, podStatus *kubecontainer.PodStatus) bool {
+	podLevelResizingInProgress := false
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) {
+		isPodLevelResizingInProgress := func() bool {
+			actuatedPodResources, _ := kl.allocationManager.GetActuatedPodLevelResources(allocatedPod.UID)
+			allocatedPodResources := allocatedPod.Spec.Resources
+			// Memory requests are excluded since they don't need to be actuated.
+
+			return allocatedPodResources.Requests[v1.ResourceCPU].Equal(actuatedPodResources.Requests[v1.ResourceCPU]) &&
+				allocatedPodResources.Limits[v1.ResourceCPU].Equal(actuatedPodResources.Limits[v1.ResourceCPU]) &&
+				allocatedPodResources.Limits[v1.ResourceMemory].Equal(actuatedPodResources.Limits[v1.ResourceMemory])
+		}
+		podLevelResizingInProgress = isPodLevelResizingInProgress()
+	}
+
 	return !podutil.VisitContainers(&allocatedPod.Spec, podutil.InitContainers|podutil.Containers,
 		func(allocatedContainer *v1.Container, containerType podutil.ContainerType) (shouldContinue bool) {
 			if !isResizableContainer(allocatedContainer, containerType) {
@@ -2984,11 +2998,11 @@ func (kl *Kubelet) isPodResizeInProgress(allocatedPod *v1.Pod, podStatus *kubeco
 				return true
 			}
 
-			actuatedResources, _ := kl.allocationManager.GetActuatedResources(allocatedPod.UID, allocatedContainer.Name)
+			actuatedResources, _ := kl.allocationManager.GetActuatedContainerResources(allocatedPod.UID, allocatedContainer.Name)
 			allocatedResources := allocatedContainer.Resources
 
 			// Memory requests are excluded since they don't need to be actuated.
-			return allocatedResources.Requests[v1.ResourceCPU].Equal(actuatedResources.Requests[v1.ResourceCPU]) &&
+			return podLevelResizingInProgress || allocatedResources.Requests[v1.ResourceCPU].Equal(actuatedResources.Requests[v1.ResourceCPU]) &&
 				allocatedResources.Limits[v1.ResourceCPU].Equal(actuatedResources.Limits[v1.ResourceCPU]) &&
 				allocatedResources.Limits[v1.ResourceMemory].Equal(actuatedResources.Limits[v1.ResourceMemory])
 		})
