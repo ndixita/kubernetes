@@ -883,6 +883,12 @@ func dropDisabledPodStatusFields(podStatus, oldPodStatus *api.PodStatus, podSpec
 		podStatus = &api.PodStatus{}
 	}
 
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && !inPlacePodVerticalScalingInUse(oldPodSpec) {
+		// Drop Resources and AllocatedResources fields from PodStatus
+		podStatus.Resources = nil
+		podStatus.AllocatedResources = nil
+	}
+
 	if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) && !inPlacePodVerticalScalingInUse(oldPodSpec) {
 		// Drop Resources fields
 		dropResourcesField := func(csl []api.ContainerStatus) {
@@ -894,6 +900,9 @@ func dropDisabledPodStatusFields(podStatus, oldPodStatus *api.PodStatus, podSpec
 		dropResourcesField(podStatus.InitContainerStatuses)
 		dropResourcesField(podStatus.EphemeralContainerStatuses)
 
+		// Drop pod-level Resources fields from PodStatus
+		podStatus.Resources = nil
+
 		// Drop AllocatedResources field
 		dropAllocatedResourcesField := func(csl []api.ContainerStatus) {
 			for i := range csl {
@@ -903,6 +912,9 @@ func dropDisabledPodStatusFields(podStatus, oldPodStatus *api.PodStatus, podSpec
 		dropAllocatedResourcesField(podStatus.ContainerStatuses)
 		dropAllocatedResourcesField(podStatus.InitContainerStatuses)
 		dropAllocatedResourcesField(podStatus.EphemeralContainerStatuses)
+
+		/// Drop pod-level AllocatedResources field
+		podStatus.AllocatedResources = nil
 	}
 
 	if !utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) && !dynamicResourceAllocationInUse(oldPodSpec) {
