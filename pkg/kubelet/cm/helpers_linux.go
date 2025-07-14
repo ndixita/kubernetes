@@ -128,6 +128,7 @@ func ResourceConfigForPod(allocatedPod *v1.Pod, enforceCPULimits bool, cpuPeriod
 		// SkipPodLevelResources is set to false when PodLevelResources feature is enabled.
 		SkipPodLevelResources: !podLevelResourcesEnabled,
 		UseStatusResources:    false,
+		UsePodStatusResources: false,
 	})
 	// track if limits were applied for each resource.
 	memoryLimitsDeclared := true

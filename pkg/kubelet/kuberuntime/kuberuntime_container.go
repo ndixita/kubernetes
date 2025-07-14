@@ -433,6 +433,7 @@ func (m *kubeGenericRuntimeManager) updatePodSandboxResources(sandboxID string, 
 		}
 		return fmt.Errorf("updatePodSandboxResources failed for sanboxID %q: %w", sandboxID, err)
 	}
+	err = m.allocationManager.SetActuatedPodLevelResources(pod)
 	return nil
 }
 

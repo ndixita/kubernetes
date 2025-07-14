@@ -348,6 +348,7 @@ type podResizeStrategy struct {
 var ResizeStrategy = podResizeStrategy{
 	podStrategy: Strategy,
 	resetFieldsFilter: fieldpath.NewIncludeMatcherFilter(
+		fieldpath.MakePrefixMatcherOrDie("spec", "resources"),
 		fieldpath.MakePrefixMatcherOrDie("spec", "containers", fieldpath.MatchAnyPathElement(), "resources"),
 		fieldpath.MakePrefixMatcherOrDie("spec", "containers", fieldpath.MatchAnyPathElement(), "resizePolicy"),
 		fieldpath.MakePrefixMatcherOrDie("spec", "initContainers", fieldpath.MatchAnyPathElement(), "resources"),
@@ -367,7 +368,12 @@ func dropNonResizeUpdates(newPod, oldPod *api.Pod) *api.Pod {
 	containers := dropNonResizeUpdatesForContainers(newPod.Spec.Containers, oldPod.Spec.Containers)
 	initContainers := dropNonResizeUpdatesForContainers(newPod.Spec.InitContainers, oldPod.Spec.InitContainers)
 
+	newPodResources := newPod.Spec.Resources
 	newPod.Spec = oldPod.Spec
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		newPod.Spec.Resources = newPodResources
+	}
+
 	newPod.Status = oldPod.Status
 	metav1.ResetObjectMetaForStatus(&newPod.ObjectMeta, &oldPod.ObjectMeta)
 

@@ -72,6 +72,7 @@ type Manager interface {
 	// pod, if actuatedContainer is nil).
 	SetActuatedResources(allocatedPod *v1.Pod, actuatedContainer *v1.Container) error
 
+	SetActuatedPodLevelResources(allocatedPod *v1.Pod) error
 	// GetActuatedResources returns the stored actuated resources for the container, and whether they exist.
 	GetActuatedResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool)
 
@@ -412,6 +413,17 @@ func updatePodFromAllocation(pod *v1.Pod, allocs state.PodResourceInfoMap) (*v1.
 	}
 
 	updated := false
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		pAlloc := allocated.PodLevelResources
+		if !apiequality.Semantic.DeepEqual(pod.Spec.Resources, pAlloc) {
+			if !updated {
+				pod = pod.DeepCopy()
+				pod.Spec.Resources = &pAlloc
+				updated = true
+			}
+		}
+	}
+
 	containerAlloc := func(c v1.Container) (v1.ResourceRequirements, bool) {
 		if cAlloc, ok := allocated.ContainerResources[c.Name]; ok {
 			if !apiequality.Semantic.DeepEqual(c.Resources, cAlloc) {
@@ -449,6 +461,12 @@ func (m *manager) SetAllocatedResources(pod *v1.Pod) error {
 
 func allocationFromPod(pod *v1.Pod) state.PodResourceInfo {
 	var podAlloc state.PodResourceInfo
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) && pod.Spec.Resources != nil {
+		klog.Info("Debug Info: %v", pod.Spec)
+		podAlloc.PodLevelResources = *pod.Spec.Resources.DeepCopy()
+	}
+
 	podAlloc.ContainerResources = make(map[string]v1.ResourceRequirements)
 	for _, container := range pod.Spec.Containers {
 		alloc := *container.Resources.DeepCopy()
@@ -526,8 +544,16 @@ func (m *manager) SetActuatedResources(allocatedPod *v1.Pod, actuatedContainer *
 	return m.actuated.SetContainerResources(allocatedPod.UID, actuatedContainer.Name, actuatedContainer.Resources)
 }
 
+func (m *manager) SetActuatedPodLevelResources(allocatedPod *v1.Pod) error {
+	return m.actuated.SetPodLevelResources(allocatedPod.UID, *allocatedPod.Spec.Resources)
+}
+
 func (m *manager) GetActuatedResources(podUID types.UID, containerName string) (v1.ResourceRequirements, bool) {
 	return m.actuated.GetContainerResources(podUID, containerName)
+}
+
+func (m *manager) GetActuatedPodLevelResources(podUID types.UID) (v1.ResourceRequirements, bool) {
+	return m.actuated.GetPodLevelResources(podUID)
 }
 
 func (m *manager) handlePodResourcesResize(pod *v1.Pod) (bool, error) {
@@ -653,6 +679,7 @@ func (m *manager) canResizePod(allocatedPods []*v1.Pod, pod *v1.Pod) (bool, stri
 	allocatable := m.containerManager.GetNodeAllocatableAbsolute()
 	cpuAvailable := allocatable.Cpu().MilliValue()
 	memAvailable := allocatable.Memory().Value()
+	// TODO(ndixita): need to modify this once Kevin's changes to helpers are finalized
 	cpuRequests := resource.GetResourceRequest(pod, v1.ResourceCPU)
 	memRequests := resource.GetResourceRequest(pod, v1.ResourceMemory)
 	if cpuRequests > cpuAvailable || memRequests > memAvailable {
@@ -668,6 +695,14 @@ func (m *manager) canResizePod(allocatedPods []*v1.Pod, pod *v1.Pod) (bool, stri
 	}
 
 	for i := range allocatedPods {
+
+		if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+			actuatedLevelPodResources, exists := m.GetActuatedPodLevelResources(allocatedPods[i].UID)
+			if exists {
+				allocatedPods[i].Status.Resources = &actuatedLevelPodResources
+			}
+		}
+
 		for j, c := range allocatedPods[i].Status.ContainerStatuses {
 			actuatedResources, exists := m.GetActuatedResources(allocatedPods[i].UID, c.Name)
 			if exists {
@@ -708,6 +743,45 @@ func (m *manager) CheckPodResizeInProgress(allocatedPod *v1.Pod, podStatus *kube
 // - Non-resizable resources: only CPU & memory are resizable
 // - Non-running containers: they will be sized correctly when (re)started
 func (m *manager) isPodResizeInProgress(allocatedPod *v1.Pod, podStatus *kubecontainer.PodStatus) bool {
+	if m.isContainerResourceResizeInProgress(allocatedPod, podStatus) {
+		return true
+	}
+
+	return m.isPodResourceResizeInProgress(allocatedPod, podStatus)
+
+}
+
+func (m *manager) getAllocatedPods(activePods []*v1.Pod) []*v1.Pod {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+		return activePods
+	}
+
+	allocatedPods := make([]*v1.Pod, len(activePods))
+	for i, pod := range activePods {
+		allocatedPods[i], _ = m.UpdatePodFromAllocation(pod)
+	}
+	return allocatedPods
+}
+
+func (m *manager) isPodResourceResizeInProgress(allocatedPod *v1.Pod, podStatus *kubecontainer.PodStatus) bool {
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		return false
+	}
+
+	if allocatedPod.Spec.Resources == nil {
+		return false
+	}
+
+	actuatedPodResources, _ := m.GetActuatedPodLevelResources(allocatedPod.UID)
+	allocatedPodResources := allocatedPod.Spec.Resources
+
+	return allocatedPodResources.Requests[v1.ResourceCPU].Equal(actuatedPodResources.Requests[v1.ResourceCPU]) &&
+		allocatedPodResources.Limits[v1.ResourceCPU].Equal(actuatedPodResources.Limits[v1.ResourceCPU]) &&
+		allocatedPodResources.Requests[v1.ResourceMemory].Equal(actuatedPodResources.Requests[v1.ResourceMemory]) &&
+		allocatedPodResources.Limits[v1.ResourceMemory].Equal(actuatedPodResources.Limits[v1.ResourceMemory])
+}
+
+func (m *manager) isContainerResourceResizeInProgress(allocatedPod *v1.Pod, podStatus *kubecontainer.PodStatus) bool {
 	return !podutil.VisitContainers(&allocatedPod.Spec, podutil.InitContainers|podutil.Containers,
 		func(allocatedContainer *v1.Container, containerType podutil.ContainerType) (shouldContinue bool) {
 			if !isResizableContainer(allocatedContainer, containerType) {
@@ -728,18 +802,6 @@ func (m *manager) isPodResizeInProgress(allocatedPod *v1.Pod, podStatus *kubecon
 				allocatedResources.Requests[v1.ResourceMemory].Equal(actuatedResources.Requests[v1.ResourceMemory]) &&
 				allocatedResources.Limits[v1.ResourceMemory].Equal(actuatedResources.Limits[v1.ResourceMemory])
 		})
-}
-
-func (m *manager) getAllocatedPods(activePods []*v1.Pod) []*v1.Pod {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
-		return activePods
-	}
-
-	allocatedPods := make([]*v1.Pod, len(activePods))
-	for i, pod := range activePods {
-		allocatedPods[i], _ = m.UpdatePodFromAllocation(pod)
-	}
-	return allocatedPods
 }
 
 func isResizableContainer(container *v1.Container, containerType podutil.ContainerType) bool {
