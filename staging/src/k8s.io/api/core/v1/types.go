@@ -5345,7 +5345,7 @@ type PodStatus struct {
 	// +featureGate=PodLevelResources
 	// +featureGate=InPlacePodLevelResourcesVerticalScaling
 	// +optional
-	AllocatedResources ResourceList `json:"allocatedResources,omitempty" protobuf:"bytes,18,rep,name=allocatedResources,casttype=ResourceList,castkey=ResourceName"`
+	AllocatedResources ResourceList `json:"allocatedResources,omitempty" protobuf:"bytes,19,rep,name=allocatedResources,casttype=ResourceList,castkey=ResourceName"`
 
 	// Resources represents the compute resource requests and limits that have been
 	// applied at the pod level. If pod-level resources are not explicitly specified,
@@ -5358,7 +5358,7 @@ type PodStatus struct {
 	// +featureGate=PodLevelResources
 	// +featureGate=InPlacePodLevelResourcesVerticalScaling
 	// +optional
-	Resources *ResourceRequirements `json:"resources,omitempty" protobuf:"bytes,19,opt,name=resources"`
+	Resources *ResourceRequirements `json:"resources,omitempty" protobuf:"bytes,20,opt,name=resources"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
