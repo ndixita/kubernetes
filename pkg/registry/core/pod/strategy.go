@@ -364,10 +364,19 @@ func dropNonResizeUpdates(newPod, oldPod *api.Pod) *api.Pod {
 		return newPod
 	}
 
+	// Preserve the incoming pod-level resource requests from the new pod object.
+	newPodResources := newPod.Spec.Resources
+
 	containers := dropNonResizeUpdatesForContainers(newPod.Spec.Containers, oldPod.Spec.Containers)
 	initContainers := dropNonResizeUpdatesForContainers(newPod.Spec.InitContainers, oldPod.Spec.InitContainers)
 
 	newPod.Spec = oldPod.Spec
+	// If PodLevelResources and InPlacePodLevelResourcesVerticalScaling feature gates are enabled,
+	// restore the saved pod-level resource requests to the new pod's spec.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		newPod.Spec.Resources = newPodResources
+	}
+
 	newPod.Status = oldPod.Status
 	metav1.ResetObjectMetaForStatus(&newPod.ObjectMeta, &oldPod.ObjectMeta)
 
