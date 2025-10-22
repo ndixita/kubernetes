@@ -19,6 +19,7 @@ package cm
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,10 +29,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 
-	"k8s.io/component-helpers/resource"
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	resourcehelper "k8s.io/component-helpers/resource"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
 	"k8s.io/kubernetes/pkg/kubelet/cm/util"
 )
 
@@ -124,7 +128,7 @@ func HugePageLimits(resourceList v1.ResourceList) map[int64]int64 {
 func ResourceConfigForPod(allocatedPod *v1.Pod, enforceCPULimits bool, cpuPeriod uint64, enforceMemoryQoS bool) *ResourceConfig {
 	podLevelResourcesEnabled := utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResources)
 	// sum requests and limits.
-	reqs := resource.PodRequests(allocatedPod, resource.PodResourcesOptions{
+	reqs := resourcehelper.PodRequests(allocatedPod, resourcehelper.PodResourcesOptions{
 		// SkipPodLevelResources is set to false when PodLevelResources feature is enabled.
 		SkipPodLevelResources: !podLevelResourcesEnabled,
 		UseStatusResources:    false,
@@ -133,10 +137,10 @@ func ResourceConfigForPod(allocatedPod *v1.Pod, enforceCPULimits bool, cpuPeriod
 	memoryLimitsDeclared := true
 	cpuLimitsDeclared := true
 
-	limits := resource.PodLimits(allocatedPod, resource.PodResourcesOptions{
+	limits := resourcehelper.PodLimits(allocatedPod, resourcehelper.PodResourcesOptions{
 		// SkipPodLevelResources is set to false when PodLevelResources feature is enabled.
 		SkipPodLevelResources: !podLevelResourcesEnabled,
-		ContainerFn: func(res v1.ResourceList, containerType resource.ContainerType) {
+		ContainerFn: func(res v1.ResourceList, containerType resourcehelper.ContainerType) {
 			if res.Cpu().IsZero() {
 				cpuLimitsDeclared = false
 			}
@@ -146,7 +150,7 @@ func ResourceConfigForPod(allocatedPod *v1.Pod, enforceCPULimits bool, cpuPeriod
 		},
 	})
 
-	if podLevelResourcesEnabled && resource.IsPodLevelResourcesSet(allocatedPod) {
+	if podLevelResourcesEnabled && resourcehelper.IsPodLevelResourcesSet(allocatedPod) {
 		if !allocatedPod.Spec.Resources.Limits.Cpu().IsZero() {
 			cpuLimitsDeclared = true
 		}
@@ -340,4 +344,54 @@ func GetKubeletContainer(kubeletCgroups string) (string, error) {
 		return cont, nil
 	}
 	return kubeletCgroups, nil
+}
+
+func CPURequestsFromConfig(podConfig *cm.ResourceConfig) *resource.Quantity {
+	var cpuRequest *resource.Quantity
+	if podConfig.CPUShares > 0 {
+		milliCPU := sharesToMilliCPU(podConfig.CpuShares)
+		if milliCPU > 0 {
+			cpuRequest = resource.NewMilliQuantity(milliCPU, resource.DecimalSI)
+		}
+	}
+
+	return cpuRequest
+}
+
+func CPULimitsFromConfig(podConfig *cm.ResourceConfig) *resource.Quantity {
+	var cpuLimit *resource.Quantity
+
+	if podConfig.CpuPeriod > 0 {
+		milliCPU := quotaToMilliCPU(podConfig.CpuQuota, podConfig.CpuPeriod)
+		if milliCPU > 0 {
+			cpuLimit = resource.NewMilliQuantity(milliCPU, resource.DecimalSI)
+		}
+		return cpuLimit
+	}
+}
+
+func MemoryLimitsFromConfig(podConfig *cm.ResourceConfig) *resource.Quantity {
+	var memLimit *resource.Quantity
+
+	if podConfig.Memory > 0 {
+		memLimit = resource.NewQuantity(podConfig.Memory, resource.BinarySI)
+	}
+	return memLimit
+}
+
+// sharesToMilliCPU converts CpuShares (cpu.shares) to milli-CPU value
+func sharesToMilliCPU(shares int64) int64 {
+	milliCPU := int64(0)
+	if shares >= int64(cm.MinShares) {
+		milliCPU = int64(math.Ceil(float64(shares*cm.MilliCPUToCPU) / float64(cm.SharesPerCPU)))
+	}
+	return milliCPU
+}
+
+// quotaToMilliCPU converts cpu.cfs_quota_us and cpu.cfs_period_us to milli-CPU value
+func quotaToMilliCPU(quota int64, period int64) int64 {
+	if quota == -1 {
+		return int64(0)
+	}
+	return (quota * cm.MilliCPUToCPU) / period
 }

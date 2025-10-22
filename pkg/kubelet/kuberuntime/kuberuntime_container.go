@@ -414,6 +414,8 @@ func (m *kubeGenericRuntimeManager) updateContainerResources(ctx context.Context
 	err := m.runtimeService.UpdateContainerResources(ctx, containerID.ID, containerResources)
 	if err == nil {
 		err = m.actuatedState.SetContainerResources(pod.UID, container.Name, container.Resources)
+		//TODO add feature gate check
+		err = m.actuatedState.SetPodLevelResources(pod.UID, *pod.Spec.Resources)
 	}
 	return err
 }

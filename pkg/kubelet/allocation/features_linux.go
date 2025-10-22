@@ -35,3 +35,7 @@ func IsInPlacePodVerticalScalingAllowed(pod *v1.Pod) (allowed bool, msg, reason 
 	}
 	return true, "", ""
 }
+
+func IsInPlacePodLevelResourcesVerticalScalingAllowed(pod *v1.Pod) (allowed bool) {
+	return utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling)
+}

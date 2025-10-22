@@ -48,6 +48,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/status"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
+	"k8s.io/kubernetes/test/e2e/feature"
 )
 
 // podStatusManagerStateFile is the file name where status manager stores its state
@@ -437,6 +438,16 @@ func updatePodFromAllocation(pod *v1.Pod, allocated state.PodResourceInfo) (*v1.
 	}
 
 	updated := false
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) {
+		pAlloc := allocated.PodLevelResources
+		if !apiequality.Semantic.DeepEqual(pod.Spec.Resources, pAlloc) {
+			if !updated {
+				pod = pod.DeepCopy()
+				pod.Spec.Resources = &pAlloc
+				updated = true
+			}
+		}
+	}
 	containerAlloc := func(c v1.Container) (v1.ResourceRequirements, bool) {
 		if cAlloc, ok := allocated.ContainerResources[c.Name]; ok {
 			if !apiequality.Semantic.DeepEqual(c.Resources, cAlloc) {
@@ -474,6 +485,9 @@ func (m *manager) SetAllocatedResources(pod *v1.Pod) error {
 
 func allocationFromPod(pod *v1.Pod) state.PodResourceInfo {
 	var podAlloc state.PodResourceInfo
+	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) && utilfeature.DefaultFeatureGate.Enabled(feature.PodLevelResources) {
+		podAlloc.PodLevelResources = *pod.Spec.Resources.DeepCopy()
+	}
 	podAlloc.ContainerResources = make(map[string]v1.ResourceRequirements)
 	for _, container := range pod.Spec.Containers {
 		alloc := *container.Resources.DeepCopy()

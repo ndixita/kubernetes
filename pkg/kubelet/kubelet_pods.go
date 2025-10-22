@@ -2102,7 +2102,68 @@ func (kl *Kubelet) convertStatusToAPIStatus(pod *v1.Pod, podStatus *kubecontaine
 		false,
 	)
 
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		apiPodStatus.Resources = kl.generatePodLevelResourcesStatus(pod, oldPodStatus)
+	}
+
 	return &apiPodStatus
+}
+
+func (kl *Kubelet) generatePodLevelResourcesStatus(pod *v1.Pod, oldPodStatus v1.PodStatus) *v1.ResourceRequirements {
+	if pod.Status.Phase != v1.PodRunning {
+		return pod.Spec.Resources
+	}
+
+	pcm := kl.containerManager.NewPodContainerManager()
+	memoryConfig, err := pcm.GetPodCgroupConfig(pod, v1.ResourceMemory)
+	if err != nil {
+		//TODO
+	}
+	memoryLimit := cm.MemoryLimitsFromConfig(memoryConfig)
+	cpuConfig, err := pcm.GetPodCgroupConfig(pod, v1.ResourceCPU)
+	if err != nil {
+		//TODO
+	}
+
+	cpuRequest := cm.CPURequestsFromConfig(cpuConfig)
+	cpuLimit := cm.CPULimitsFromConfig(cpuConfig)
+
+	resources := pod.Spec.Resources.DeepCopy()
+	if resources.Requests != nil {
+		if cpuRequest != nil {
+			if cpuRequest.MilliValue() > cm.MinShares || resources.Requests.Cpu().MilliValue() > cm.MinShares {
+				resources.Requests[v1.ResourceCPU] = cpuRequest.DeepCopy()
+			}
+		} else {
+			if pod.Status.Phase == v1.PodRunning && oldPodStatus.Phase == v1.PodRunning && oldPodStatus.Resources != nil {
+				resources.Requests[v1.ResourceCPU] = oldPodStatus.Resources.Requests[v1.ResourceCPU]
+			}
+		}
+	}
+
+	if resources.Limits != nil {
+		if cpuLimit != nil {
+			if cpuLimit.MilliValue() > cm.MinMilliCPULimit || resources.Limits.Cpu().MilliValue() > cm.MinMilliCPULimit {
+				resources.Limits[v1.ResourceCPU] = cpuLimit.DeepCopy()
+			}
+		} else {
+			if pod.Status.Phase == v1.PodRunning && oldPodStatus.Phase == v1.PodRunning && oldPodStatus.Resources != nil {
+				resources.Limits[v1.ResourceCPU] = oldPodStatus.Resources.Limits[v1.ResourceCPU]
+			}
+		}
+
+		if memoryLimit != nil {
+			if cpuLimit.MilliValue() > cm.MinMilliCPULimit || resources.Limits.Cpu().MilliValue() > cm.MinMilliCPULimit {
+				resources.Limits[v1.ResourceMemory] = memoryLimit.DeepCopy()
+			}
+		} else {
+			if pod.Status.Phase == v1.PodRunning && oldPodStatus.Phase == v1.PodRunning && oldPodStatus.Resources != nil {
+				resources.Limits[v1.ResourceMemory] = oldPodStatus.Resources.Limits[v1.ResourceMemory]
+			}
+		}
+	}
+
+	return resources
 }
 
 // convertToAPIContainerStatuses converts the given internal container
