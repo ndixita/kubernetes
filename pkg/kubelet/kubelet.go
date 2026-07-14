@@ -2913,8 +2913,10 @@ func (kl *Kubelet) HandlePodAdditions(ctx context.Context, pods []*v1.Pod) {
 				// Instead, we record the metric here in HandlePodAdditions for new pods
 				// and capture resize events separately.
 				recordAdmissionRejection(reason)
+				kl.recordPodLevelResourcesAdmission(pod, "rejected")
 				continue
 			}
+			kl.recordPodLevelResourcesAdmission(pod, "admitted")
 
 			if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
 				// Backfill the queue of pending resizes, but only after all the pods have

@@ -2954,3 +2954,45 @@ func resolveRecursiveReadOnly(m v1.VolumeMount, runtimeSupportsRRO bool) (bool, 
 		return false, fmt.Errorf("unknown recursive read-only mode %q", rroMode)
 	}
 }
+
+func (kl *Kubelet) recordPodLevelResourcesAdmission(pod *v1.Pod, status string) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) {
+		return
+	}
+
+	hasResources := func(containers []v1.Container) bool {
+		for _, c := range containers {
+			if len(c.Resources.Requests) > 0 || len(c.Resources.Limits) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+
+	hasPodLevel := resourcehelper.IsPodLevelResourcesSet(pod)
+	hasContainerLevel := hasResources(pod.Spec.Containers) || hasResources(pod.Spec.InitContainers)
+
+	var configMode string
+	switch {
+	case hasPodLevel && hasContainerLevel:
+		configMode = "pod_and_container_level"
+	case hasPodLevel:
+		configMode = "pod_level_only"
+	default:
+		configMode = "container_level"
+	}
+
+	qosLabel := getQOSLabel(pod)
+	metrics.PodLevelResourcesAdmissionTotal.WithLabelValues(configMode, status, qosLabel).Inc()
+}
+
+func getQOSLabel(pod *v1.Pod) string {
+	switch v1qos.GetPodQOS(pod) {
+	case v1.PodQOSGuaranteed:
+		return "guaranteed"
+	case v1.PodQOSBurstable:
+		return "burstable"
+	default:
+		return "best_effort"
+	}
+}

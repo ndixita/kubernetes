@@ -205,6 +205,10 @@ const (
 
 	// Metric key for podsapi
 	PodWatchEventsDroppedKey = "pod_watch_events_dropped_total"
+
+	// Metric keys for pod level resources metrics.
+	PodLevelResourcesAdmissionTotalKey = "pod_level_resources_admission_total"
+	OOMKillsTotalKey                   = "oom_kills_total"
 )
 
 type imageSizeBucket struct {
@@ -1303,6 +1307,31 @@ var (
 			StabilityLevel: metrics.ALPHA,
 		},
 	)
+
+	// PodLevelResourcesAdmissionTotal tracks pod level resources feature admission metrics.
+	// Bounded cardinality: max 18 series (3 config_modes * 2 statuses * 3 qos_classes).
+	// Note: This metric is ALPHA and temporary. It is intended to track feature adoption while the
+	// feature is new and is scheduled to be removed 2-3 releases after the Pod-Level Resources feature reaches GA.
+	PodLevelResourcesAdmissionTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      KubeletSubsystem,
+			Name:           PodLevelResourcesAdmissionTotalKey,
+			Help:           "Total number of pods processed during Kubelet admission, categorized by resource configuration strategy, status (admitted, rejected) and QoS class.",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"config_mode", "status", "qos_class"},
+	)
+
+	// OOMKillsTotal tracks the cumulative number of OOM kills.
+	OOMKillsTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      KubeletSubsystem,
+			Name:           OOMKillsTotalKey,
+			Help:           "Total number of OOM kills triggered. This generic metric uses labels to distinguish between pod-level and container-level events.",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"scope", "resource"},
+	)
 )
 
 var registerMetrics sync.Once
@@ -1433,6 +1462,8 @@ func Register() {
 		}
 
 		legacyregistry.MustRegister(PodWatchEventsDroppedTotal)
+		legacyregistry.MustRegister(PodLevelResourcesAdmissionTotal)
+		legacyregistry.MustRegister(OOMKillsTotal)
 	})
 }
 
