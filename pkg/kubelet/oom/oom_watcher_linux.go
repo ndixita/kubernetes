@@ -21,11 +21,14 @@ package oom
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/third_party/forked/cadvisor/oomparser"
 )
 
@@ -38,13 +41,14 @@ var _ streamer = &oomparser.OomParser{}
 type realWatcher struct {
 	recorder    record.EventRecorderLogger
 	oomStreamer streamer
+	pcm         cm.PodContainerManager
 }
 
 var _ Watcher = &realWatcher{}
 
 // NewWatcher creates and initializes an OOMWatcher backed by the kernel log
 // (/dev/kmsg) oom streamer.
-func NewWatcher(recorder record.EventRecorderLogger) (Watcher, error) {
+func NewWatcher(recorder record.EventRecorderLogger, pcm cm.PodContainerManager) (Watcher, error) {
 	// for test purpose
 	_, ok := recorder.(*record.FakeRecorder)
 	if ok {
@@ -59,6 +63,7 @@ func NewWatcher(recorder record.EventRecorderLogger) (Watcher, error) {
 	watcher := &realWatcher{
 		recorder:    recorder,
 		oomStreamer: oomStreamer,
+		pcm:         pcm,
 	}
 
 	return watcher, nil
@@ -90,6 +95,18 @@ func (ow *realWatcher) Start(ctx context.Context, ref *v1.ObjectReference) error
 					eventMsg = fmt.Sprintf("%s, victim process: %s, pid: %d", eventMsg, event.ProcessName, event.Pid)
 				}
 				ow.recorder.WithLogger(logger).Eventf(ref, v1.EventTypeWarning, systemOOMEvent, "%s", eventMsg)
+				metrics.OOMKillsTotal.WithLabelValues("other", "memory").Inc()
+			} else if ow.pcm != nil {
+				if isPod, _ := ow.pcm.IsPodCgroup(event.VictimContainerName); isPod {
+					metrics.OOMKillsTotal.WithLabelValues("pod", "memory").Inc()
+				} else {
+					parent := filepath.Dir(event.VictimContainerName)
+					if isPodParent, _ := ow.pcm.IsPodCgroup(parent); isPodParent {
+						metrics.OOMKillsTotal.WithLabelValues("container", "memory").Inc()
+					} else {
+						metrics.OOMKillsTotal.WithLabelValues("other", "memory").Inc()
+					}
+				}
 			}
 		}
 		logger.Error(nil, "Unexpectedly stopped receiving OOM notifications")

@@ -23,6 +23,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
 )
 
 type oomWatcherUnsupported struct{}
@@ -30,7 +31,7 @@ type oomWatcherUnsupported struct{}
 var _ Watcher = new(oomWatcherUnsupported)
 
 // NewWatcher creates a fake one here
-func NewWatcher(_ record.EventRecorder) (Watcher, error) {
+func NewWatcher(_ record.EventRecorderLogger, _ cm.PodContainerManager) (Watcher, error) {
 	return &oomWatcherUnsupported{}, nil
 }
 
