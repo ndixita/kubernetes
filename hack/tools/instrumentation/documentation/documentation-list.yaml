@@ -3490,6 +3490,16 @@
   componentEndpoints:
   - component: kubelet
     endpoint: /metrics
+- name: kubelet_cpu_cfs_throttled_seconds_total
+  help: Total time in seconds that containers were throttled due to exceeding CPU
+    limits.
+  type: Custom
+  stabilityLevel: ALPHA
+  labels:
+  - scope
+  componentEndpoints:
+  - component: kubelet
+    endpoint: /metrics
 - name: cpu_manager_allocation_per_numa
   subsystem: kubelet
   help: Number of CPUs allocated per NUMA node
@@ -3984,6 +3994,18 @@
   componentEndpoints:
   - component: kubelet
     endpoint: /metrics
+- name: oom_kills_total
+  subsystem: kubelet
+  help: Total number of OOM kills triggered. This generic metric uses labels to distinguish
+    between pod-level and container-level events.
+  type: Counter
+  stabilityLevel: ALPHA
+  labels:
+  - resource
+  - scope
+  componentEndpoints:
+  - component: kubelet
+    endpoint: /metrics
 - name: orphan_pod_cleaned_volumes
   subsystem: kubelet
   help: The total number of orphaned Pods whose volumes were cleaned in the last periodic
@@ -4114,6 +4136,19 @@
   stabilityLevel: ALPHA
   labels:
   - reason_detail
+  componentEndpoints:
+  - component: kubelet
+    endpoint: /metrics
+- name: pod_level_resources_admission_total
+  subsystem: kubelet
+  help: Total number of pods processed during Kubelet admission, categorized by resource
+    configuration strategy, status (admitted, rejected) and QoS class.
+  type: Counter
+  stabilityLevel: ALPHA
+  labels:
+  - config_mode
+  - qos_class
+  - status
   componentEndpoints:
   - component: kubelet
     endpoint: /metrics
