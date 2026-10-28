@@ -250,9 +250,10 @@ type PodSpecApplyConfiguration struct {
 	// by name.
 	// This field is immutable.
 	ResourceClaims []PodResourceClaimApplyConfiguration `json:"resourceClaims,omitempty"`
-	// resources is the total amount of CPU and Memory resources required by all
+	// resources is the total amount of CPU, Memory, and EphemeralStorage resources required by all
 	// containers in the pod. It supports specifying Requests and Limits for
-	// "cpu", "memory" and "hugepages-" resource names only. ResourceClaims are not supported.
+	// "cpu", "memory", "hugepages-", and "ephemeral-storage" (when the PodLevelResourcesEphemeralStorage
+	// feature gate is enabled) resource names only. ResourceClaims are not supported.
 	//
 	// This field enables fine-grained control over resource allocation for the
 	// entire pod, allowing resource sharing among containers in a pod.
@@ -262,6 +263,11 @@ type PodSpecApplyConfiguration struct {
 	// - For cpu and memory, the aggregate is used only if every init and regular container
 	// specifies a limit; otherwise the pod is not limited for that resource.
 	// - For hugepages, the container limits are summed and unspecified values are treated as 0.
+	// - For ephemeral-storage, when at least one container specifies a limit, the kubelet
+	// evicts the pod if total usage exceeds the sum of the container limits that are set
+	// (unspecified values are treated as 0); the pod-level limit is filled in automatically
+	// only when pod-level ephemeral-storage requests are set and every init and regular
+	// container specifies a limit.
 	//
 	// More details: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
 	Resources *ResourceRequirementsApplyConfiguration `json:"resources,omitempty"`
