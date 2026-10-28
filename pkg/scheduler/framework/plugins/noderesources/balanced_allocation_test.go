@@ -48,15 +48,17 @@ func testNodeResourcesBalancedAllocation(tCtx ktesting.TContext) {
 	}
 
 	tests := []struct {
-		name                       string
-		requestedPod               *v1.Pod
-		nodes                      []*v1.Node
-		existingPods               []*v1.Pod
-		expectedScores             fwk.NodeScoreList
-		args                       config.NodeResourcesBalancedAllocationArgs
-		runPreScore                bool
-		expectedPreScoreStatusCode fwk.Code
-		draObjects                 []apiruntime.Object
+		name                                    string
+		requestedPod                            *v1.Pod
+		nodes                                   []*v1.Node
+		existingPods                            []*v1.Pod
+		expectedScores                          fwk.NodeScoreList
+		args                                    config.NodeResourcesBalancedAllocationArgs
+		runPreScore                             bool
+		expectedPreScoreStatusCode              fwk.Code
+		draObjects                              []apiruntime.Object
+		enablePodLevelResources                 bool
+		enablePodLevelResourcesEphemeralStorage bool
 	}{
 		{
 			// bestEffort pods, skip in PreScore
@@ -314,6 +316,43 @@ func testNodeResourcesBalancedAllocation(tCtx ktesting.TContext) {
 			},
 			runPreScore: false,
 		},
+		{
+			name: "pod-level ephemeral-storage honored in BalancedAllocation when enabled",
+			requestedPod: st.MakePod().PodLevelResourceRequests(map[v1.ResourceName]string{
+				v1.ResourceCPU:              "3000m",
+				v1.ResourceEphemeralStorage: "5000",
+			}).Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{"cpu": "4000m", "ephemeral-storage": "10000"}).Obj(),
+				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000m", "ephemeral-storage": "10000"}).Obj(),
+			},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 68}, {Name: "node2", Score: 75}},
+			args: config.NodeResourcesBalancedAllocationArgs{Resources: []config.ResourceSpec{
+				{Name: string(v1.ResourceCPU), Weight: 1},
+				{Name: string(v1.ResourceEphemeralStorage), Weight: 1},
+			}},
+			runPreScore:                             true,
+			expectedPreScoreStatusCode:              fwk.Success,
+			enablePodLevelResources:                 true,
+			enablePodLevelResourcesEphemeralStorage: true,
+		},
+		{
+			name: "ephemeral-storage-only pod-level request skipped in PreScore when PodLevelResourcesEphemeralStorage disabled",
+			requestedPod: st.MakePod().PodLevelResourceRequests(map[v1.ResourceName]string{
+				v1.ResourceEphemeralStorage: "5000",
+			}).Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{"cpu": "4000m", "ephemeral-storage": "10000"}).Obj(),
+			},
+			args: config.NodeResourcesBalancedAllocationArgs{Resources: []config.ResourceSpec{
+				{Name: string(v1.ResourceCPU), Weight: 1},
+				{Name: string(v1.ResourceEphemeralStorage), Weight: 1},
+			}},
+			runPreScore:                             true,
+			expectedPreScoreStatusCode:              fwk.Skip,
+			enablePodLevelResources:                 true,
+			enablePodLevelResourcesEphemeralStorage: false,
+		},
 	}
 
 	for _, test := range tests {
@@ -327,9 +366,12 @@ func testNodeResourcesBalancedAllocation(tCtx ktesting.TContext) {
 			tCtx.Cleanup(func() {
 				runtime.WaitForShutdown(fh)
 			})
-			p, _ := NewBalancedAllocation(tCtx, &test.args, fh, feature.Features{
-				EnableDRAExtendedResource: test.draObjects != nil,
+			p, err := NewBalancedAllocation(tCtx, &test.args, fh, feature.Features{
+				EnableDRAExtendedResource:               test.draObjects != nil,
+				EnablePodLevelResources:                 test.enablePodLevelResources,
+				EnablePodLevelResourcesEphemeralStorage: test.enablePodLevelResourcesEphemeralStorage,
 			})
+			tCtx.ExpectNoError(err)
 
 			draManager := newTestDRAManager(tCtx, test.draObjects...)
 			p.(*BalancedAllocation).draManager = draManager

@@ -824,10 +824,13 @@ func testNotEnoughRequests(tCtx ktesting.TContext) {
 func TestStorageRequests(t *testing.T) { testStorageRequests(ktesting.Init(t)) }
 func testStorageRequests(tCtx ktesting.TContext) {
 	storagePodsTests := []struct {
-		pod        *v1.Pod
-		nodeInfo   *framework.NodeInfo
-		name       string
-		wantStatus *fwk.Status
+		pod                                      *v1.Pod
+		nodeInfo                                 *framework.NodeInfo
+		name                                     string
+		podLevelResourcesEnabled                 bool
+		podLevelResourcesEphemeralStorageEnabled bool
+		noNodeEphemeralStorage                   bool
+		wantStatus                               *fwk.Status
 	}{
 		{
 			pod: newResourcePod(framework.Resource{MilliCPU: 1, Memory: 1}),
@@ -854,14 +857,82 @@ func testStorageRequests(tCtx ktesting.TContext) {
 				newResourcePod(framework.Resource{MilliCPU: 2, Memory: 2})),
 			name: "pod fits",
 		},
+		{
+			pod: newPodLevelResourcesPod(
+				newResourcePod(framework.Resource{EphemeralStorage: 5}),
+				v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceEphemeralStorage: *resource.NewQuantity(15, resource.BinarySI)}},
+			),
+			nodeInfo: framework.NewNodeInfo(
+				newResourcePod(framework.Resource{MilliCPU: 2, Memory: 2, EphemeralStorage: 5})),
+			name:                                     "pod-level ephemeral-storage fits when enabled",
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+		},
+		{
+			pod: newPodLevelResourcesPod(
+				newResourcePod(framework.Resource{EphemeralStorage: 5}),
+				v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceEphemeralStorage: *resource.NewQuantity(25, resource.BinarySI)}},
+			),
+			nodeInfo: framework.NewNodeInfo(
+				newResourcePod(framework.Resource{MilliCPU: 2, Memory: 2})),
+			name:                                     "pod-level ephemeral-storage exceeds allocatable when enabled",
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+			wantStatus:                               fwk.NewStatus(fwk.UnschedulableAndUnresolvable, getErrReason(v1.ResourceEphemeralStorage)),
+		},
+		{
+			pod: newPodLevelResourcesPod(
+				newResourcePod(framework.Resource{EphemeralStorage: 5}),
+				v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceEphemeralStorage: *resource.NewQuantity(15, resource.BinarySI)}},
+			),
+			nodeInfo: framework.NewNodeInfo(
+				newResourcePod(framework.Resource{MilliCPU: 2, Memory: 2, EphemeralStorage: 10})),
+			name:                                     "pod-level ephemeral-storage exceeds remaining allocatable when enabled",
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+			wantStatus:                               fwk.NewStatus(fwk.Unschedulable, getErrReason(v1.ResourceEphemeralStorage)),
+		},
+		{
+			pod: newPodLevelResourcesPod(
+				newResourcePod(framework.Resource{}),
+				v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceEphemeralStorage: *resource.NewQuantity(5, resource.BinarySI)}},
+			),
+			nodeInfo: framework.NewNodeInfo(
+				newResourcePod(framework.Resource{MilliCPU: 2, Memory: 2})),
+			name:                                     "pod-level ephemeral-storage rejected on node without ephemeral-storage capacity",
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+			noNodeEphemeralStorage:                   true,
+			wantStatus:                               fwk.NewStatus(fwk.UnschedulableAndUnresolvable, getErrReason(v1.ResourceEphemeralStorage)),
+		},
+		{
+			pod: newPodLevelResourcesPod(
+				newResourcePod(framework.Resource{EphemeralStorage: 5}),
+				v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceEphemeralStorage: *resource.NewQuantity(25, resource.BinarySI)}},
+			),
+			nodeInfo: framework.NewNodeInfo(
+				newResourcePod(framework.Resource{MilliCPU: 2, Memory: 2})),
+			name:                                     "pod-level ephemeral-storage ignored when PodLevelResourcesEphemeralStorage disabled",
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: false,
+		},
 	}
 
 	for _, test := range storagePodsTests {
 		tCtx.Run(test.name, func(tCtx ktesting.TContext) {
-			node := v1.Node{Status: v1.NodeStatus{Capacity: makeResources(10, 20, 32, 5, 20, 5), Allocatable: makeAllocatableResources(10, 20, 32, 5, 20, 5)}}
+			capList := makeResources(10, 20, 32, 5, 20, 5)
+			allocList := makeAllocatableResources(10, 20, 32, 5, 20, 5)
+			if test.noNodeEphemeralStorage {
+				delete(capList, v1.ResourceEphemeralStorage)
+				delete(allocList, v1.ResourceEphemeralStorage)
+			}
+			node := v1.Node{Status: v1.NodeStatus{Capacity: capList, Allocatable: allocList}}
 			test.nodeInfo.SetNode(&node)
 
-			p, err := NewFit(tCtx, &config.NodeResourcesFitArgs{ScoringStrategy: defaultScoringStrategy}, nil, plfeature.Features{})
+			p, err := NewFit(tCtx, &config.NodeResourcesFitArgs{ScoringStrategy: defaultScoringStrategy}, nil, plfeature.Features{
+				EnablePodLevelResources:                 test.podLevelResourcesEnabled,
+				EnablePodLevelResourcesEphemeralStorage: test.podLevelResourcesEphemeralStorageEnabled,
+			})
 			tCtx.ExpectNoError(err, "create fit plugin")
 			cycleState := framework.NewCycleState()
 			_, preFilterStatus := p.(fwk.PreFilterPlugin).PreFilter(tCtx, cycleState, test.pod, nil)
@@ -1623,6 +1694,12 @@ func Test_isSchedulableAfterAssignedPodScaleDown(t *testing.T) {
 			newObj:       st.MakePod().Name("pod2").UID("pod2").PodLevelResourceRequests(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Node("fake").Obj(),
 			expectedHint: fwk.Queue,
 		},
+		"queue-on-other-pod-ephemeral-storage-pod-level-resource-scale-down": {
+			pod:          st.MakePod().Name("pod1").UID("pod1").PodLevelResourceRequests(map[v1.ResourceName]string{v1.ResourceEphemeralStorage: "1Gi"}).Obj(),
+			oldObj:       st.MakePod().Name("pod2").UID("pod2").PodLevelResourceRequests(map[v1.ResourceName]string{v1.ResourceEphemeralStorage: "2Gi"}).Node("fake").Obj(),
+			newObj:       st.MakePod().Name("pod2").UID("pod2").PodLevelResourceRequests(map[v1.ResourceName]string{v1.ResourceEphemeralStorage: "1Gi"}).Node("fake").Obj(),
+			expectedHint: fwk.Queue,
+		},
 		"skip-queue-on-other-pod-scaled-down-different-node-when-deferred": {
 			pod:          st.MakePod().Name("pod1").Node("node1").Condition(v1.PodResizePending, v1.ConditionTrue, v1.PodReasonDeferred).Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Obj(),
 			oldObj:       st.MakePod().Name("pod2").Node("node2").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj(),
@@ -1643,6 +1720,8 @@ func Test_isSchedulableAfterAssignedPodScaleDown(t *testing.T) {
 			p, err := NewFit(ctx, &config.NodeResourcesFitArgs{ScoringStrategy: defaultScoringStrategy}, nil, plfeature.Features{
 				EnableInPlacePodVerticalScaling:                    true,
 				EnableInPlacePodVerticalScalingSchedulerPreemption: true,
+				EnablePodLevelResources:                            true,
+				EnablePodLevelResourcesEphemeralStorage:            true,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -2064,10 +2143,11 @@ func Test_isSchedulableAfterAssignedPodScaleUp(t *testing.T) {
 
 func TestIsFit(t *testing.T) {
 	testCases := map[string]struct {
-		pod                      *v1.Pod
-		node                     *v1.Node
-		podLevelResourcesEnabled bool
-		expected                 bool
+		pod                                      *v1.Pod
+		node                                     *v1.Node
+		podLevelResourcesEnabled                 bool
+		podLevelResourcesEphemeralStorageEnabled bool
+		expected                                 bool
 	}{
 		"nil node": {
 			pod:      &v1.Pod{},
@@ -2115,11 +2195,42 @@ func TestIsFit(t *testing.T) {
 			podLevelResourcesEnabled: true,
 			expected:                 false,
 		},
+		"sufficient pod-level resource ephemeral-storage": {
+			pod: st.MakePod().Resources(
+				v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("2Gi")}},
+			).Obj(),
+			node:                                     st.MakeNode().Capacity(map[v1.ResourceName]string{v1.ResourceEphemeralStorage: "4Gi"}).Obj(),
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+			expected:                                 true,
+		},
+		"insufficient pod-level resource ephemeral-storage": {
+			pod: st.MakePod().Resources(
+				v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("6Gi")}},
+			).Obj(),
+			node:                                     st.MakeNode().Capacity(map[v1.ResourceName]string{v1.ResourceEphemeralStorage: "4Gi"}).Obj(),
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+			expected:                                 false,
+		},
+		"pod-level resource ephemeral-storage ignored when gate disabled": {
+			pod: st.MakePod().Resources(
+				v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("6Gi")}},
+			).Obj(),
+			node:                                     st.MakeNode().Capacity(map[v1.ResourceName]string{v1.ResourceEphemeralStorage: "4Gi"}).Obj(),
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: false,
+			expected:                                 true,
+		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			if got := isFit(tc.pod, tc.node, nil, ResourceRequestsOptions{EnablePodLevelResources: tc.podLevelResourcesEnabled}); got != tc.expected {
+			opts := ResourceRequestsOptions{
+				EnablePodLevelResources:                 tc.podLevelResourcesEnabled,
+				EnablePodLevelResourcesEphemeralStorage: tc.podLevelResourcesEphemeralStorageEnabled,
+			}
+			if got := isFit(tc.pod, tc.node, nil, opts); got != tc.expected {
 				t.Errorf("expected: %v, got: %v", tc.expected, got)
 			}
 		})

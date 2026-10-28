@@ -418,9 +418,12 @@ func (pl *DynamicResources) validatePodLevelResourcesCoverDRA(pod *v1.Pod) *fwk.
 		}
 		requestWithoutPodLevel := resourcehelper.AggregateContainerRequests(pod, opts)
 
+		plrOpts := resourcehelper.PodResourcesOptions{
+			PodLevelResourcesEphemeralStorageEnabled: pl.fts.EnablePodLevelResourcesEphemeralStorage,
+		}
 		// For resources specified at pod level, check if container and DRA aggregates do not exceed pod level budget.
 		for resName, podLevelReq := range pod.Spec.Resources.Requests {
-			if !resourcehelper.IsSupportedPodLevelResource(resName) {
+			if !resourcehelper.IsSupportedPodLevelResourceWithOpts(resName, plrOpts) {
 				continue
 			}
 			val, ok := requestWithoutPodLevel[resName]
@@ -522,6 +525,7 @@ func (pl *DynamicResources) getPodNodeAllocatableResourceFootprint(logger klog.L
 	// Calculate the final totalPodDemand to be used for node fitting
 	optsTotal := resourcehelper.PodResourcesOptions{
 		SkipPodLevelResources:                    !pl.fts.EnablePodLevelResources,
+		PodLevelResourcesEphemeralStorageEnabled: pl.fts.EnablePodLevelResourcesEphemeralStorage,
 		UseDRANodeAllocatableResourceClaimStatus: true,
 	}
 	// Perform shallow copy - we only use the resource information from container and pod spec to calculatate the resource foot print.

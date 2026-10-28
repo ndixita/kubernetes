@@ -43,6 +43,7 @@ func TestMostAllocatedScoringStrategy(t *testing.T) {
 		existingPods   []*v1.Pod
 		expectedScores fwk.NodeScoreList
 		resources      []config.ResourceSpec
+		features       plfeature.Features
 		wantErrs       field.ErrorList
 		wantStatusCode fwk.Code
 	}{
@@ -342,6 +343,29 @@ func TestMostAllocatedScoringStrategy(t *testing.T) {
 				{Name: string(v1.ResourceMemory), Weight: 1},
 			},
 		},
+		{
+			name: "pod-level ephemeral-storage honored in MostAllocated when enabled",
+			requestedPod: st.MakePod().Req(map[v1.ResourceName]string{
+				v1.ResourceCPU:    "3000",
+				v1.ResourceMemory: "5000",
+			}).PodLevelResourceRequests(map[v1.ResourceName]string{
+				v1.ResourceEphemeralStorage: "2000",
+			}).Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000", "ephemeral-storage": "4000"}).Obj(),
+				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000", "ephemeral-storage": "10000"}).Obj(),
+			},
+			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 40}},
+			resources: []config.ResourceSpec{
+				{Name: string(v1.ResourceCPU), Weight: 1},
+				{Name: string(v1.ResourceMemory), Weight: 1},
+				{Name: string(v1.ResourceEphemeralStorage), Weight: 1},
+			},
+			features: plfeature.Features{
+				EnablePodLevelResources:                 true,
+				EnablePodLevelResourcesEphemeralStorage: true,
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -360,7 +384,7 @@ func TestMostAllocatedScoringStrategy(t *testing.T) {
 						Type:      config.MostAllocated,
 						Resources: test.resources,
 					},
-				}, fh, plfeature.Features{})
+				}, fh, test.features)
 
 			if diff := cmp.Diff(test.wantErrs.ToAggregate(), err, ignoreBadValueDetail); diff != "" {
 				t.Fatalf("got err (-want,+got):\n%s", diff)

@@ -107,7 +107,9 @@ type podChangeExtractor func(newPod *v1.Pod, oldPod *v1.Pod) fwk.ActionType
 // extractPodScaleDown interprets the update of a pod and returns PodRequestScaledDown event if any pod's resource request(s) is scaled down.
 func extractPodScaleDown(newPod, oldPod *v1.Pod) fwk.ActionType {
 	opt := resource.PodResourcesOptions{
-		UseStatusResources: utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling),
+		UseStatusResources:                             utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling),
+		SkipPodLevelResources:                          !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources),
+		PodLevelResourcesEphemeralStorageEnabled:       utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesEphemeralStorage),
 		InPlacePodLevelResourcesVerticalScalingEnabled: utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling),
 	}
 	newPodRequests := resource.PodRequests(newPod, opt)
@@ -132,7 +134,9 @@ func extractPodScaleDown(newPod, oldPod *v1.Pod) fwk.ActionType {
 // extractPodScaleUp interprets the update of a pod and returns PodRequestScaledUp event if any pod's resource request(s) is scaled up.
 func extractPodScaleUp(newPod, oldPod *v1.Pod) fwk.ActionType {
 	opt := resource.PodResourcesOptions{
-		UseStatusResources: utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling),
+		UseStatusResources:                             utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling),
+		SkipPodLevelResources:                          !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources),
+		PodLevelResourcesEphemeralStorageEnabled:       utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesEphemeralStorage),
 		InPlacePodLevelResourcesVerticalScalingEnabled: utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling),
 	}
 	newPodRequests := resource.PodRequests(newPod, opt)

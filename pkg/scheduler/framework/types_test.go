@@ -2259,15 +2259,16 @@ var (
 
 func TestPodInfoCalculateResources(t *testing.T) {
 	testCases := []struct {
-		name                                 string
-		containers                           []v1.Container
-		podResources                         *v1.ResourceRequirements
-		podLevelResourcesEnabled             bool
-		nodeAllocatableResourcesDRAEnabled   bool
-		nodeAllocatableResourceClaimStatuses []v1.NodeAllocatableResourceClaimStatus
-		expectedResource                     fwk.PodResource
-		initContainers                       []v1.Container
-		overhead                             *v1.ResourceList
+		name                                     string
+		containers                               []v1.Container
+		podResources                             *v1.ResourceRequirements
+		podLevelResourcesEnabled                 bool
+		podLevelResourcesEphemeralStorageEnabled bool
+		nodeAllocatableResourcesDRAEnabled       bool
+		nodeAllocatableResourceClaimStatuses     []v1.NodeAllocatableResourceClaimStatus
+		expectedResource                         fwk.PodResource
+		initContainers                           []v1.Container
+		overhead                                 *v1.ResourceList
 	}{
 		{
 			name:       "requestless container",
@@ -2884,13 +2885,72 @@ func TestPodInfoCalculateResources(t *testing.T) {
 				Non0Mem: mem500M.Value() + mem200M.Value() + mem200M.Value() + mem200M.Value(),
 			},
 		},
+		{
+			name:                                     "pod-level ephemeral-storage request enabled preserves default Non0CPU and Non0Mem",
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceEphemeralStorage: mem500M,
+						},
+					},
+				},
+			},
+			podResources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceEphemeralStorage: mem1200M,
+				},
+			},
+			expectedResource: fwk.PodResource{
+				Resource: &Resource{
+					EphemeralStorage: mem1200M.Value(),
+				},
+				Non0CPU: schedutil.DefaultMilliCPURequest,
+				Non0Mem: schedutil.DefaultMemoryRequest,
+			},
+		},
+		{
+			name:                                     "pod-level ephemeral-storage request disabled falls back to container ephemeral-storage",
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: false,
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceEphemeralStorage: mem500M,
+						},
+					},
+				},
+			},
+			podResources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceEphemeralStorage: mem1200M,
+				},
+			},
+			expectedResource: fwk.PodResource{
+				Resource: &Resource{
+					EphemeralStorage: mem500M.Value(),
+				},
+				Non0CPU: schedutil.DefaultMilliCPURequest,
+				Non0Mem: schedutil.DefaultMemoryRequest,
+			},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			overrides := featuregatetesting.FeatureOverrides{
 				features.PodLevelResources:           tc.podLevelResourcesEnabled,
 				features.DRANodeAllocatableResources: tc.nodeAllocatableResourcesDRAEnabled,
-			})
+			}
+			if tc.podLevelResourcesEphemeralStorageEnabled {
+				overrides[features.NodeDeclaredFeatures] = true
+				overrides[features.PodLevelResourcesEphemeralStorage] = true
+			} else {
+				overrides[features.PodLevelResourcesEphemeralStorage] = false
+			}
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, overrides)
 			podSpec := v1.PodSpec{
 				Resources:      tc.podResources,
 				Containers:     tc.containers,

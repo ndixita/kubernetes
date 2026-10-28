@@ -286,9 +286,10 @@ func TestMergePodResourceRequirements(t *testing.T) {
 
 func TestPodLimitFunc(t *testing.T) {
 	type testCase struct {
-		pod                      api.Pod
-		limitRange               corev1.LimitRange
-		podLevelResourcesEnabled bool
+		pod                                      api.Pod
+		limitRange                               corev1.LimitRange
+		podLevelResourcesEnabled                 bool
+		podLevelResourcesEphemeralStorageEnabled bool
 	}
 
 	successCases := []testCase{
@@ -481,11 +482,40 @@ func TestPodLimitFunc(t *testing.T) {
 			limitRange:               createLimitRange(api.LimitTypePod, getComputeResourceList("", ""), getComputeResourceList("160m", "200Mi"), api.ResourceList{}, api.ResourceList{}, api.ResourceList{}),
 			podLevelResourcesEnabled: true,
 		},
+		{
+			pod: validPodWithPodLevelResources("pod-level-ephemeral-storage-with-min-max-ratio", 3,
+				getResourceRequirements(getLocalStorageResourceList("300Mi"), getLocalStorageResourceList("400Mi")),
+				getResourceRequirements(getLocalStorageResourceList("500Mi"), getLocalStorageResourceList("750Mi")),
+			),
+			limitRange:                               createLimitRange(api.LimitTypePod, getLocalStorageResourceList("400Mi"), getLocalStorageResourceList("1Gi"), api.ResourceList{}, api.ResourceList{}, getLocalStorageResourceList("1.5")),
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+		},
+		{
+			pod: validPodWithPodLevelResources("pod-level-ephemeral-storage-ignored-when-gate-disabled", 2,
+				getResourceRequirements(getLocalStorageResourceList("300Mi"), getLocalStorageResourceList("400Mi")),
+				getResourceRequirements(getLocalStorageResourceList("500Mi"), getLocalStorageResourceList("4Gi")),
+			),
+			limitRange:                               createLimitRange(api.LimitTypePod, api.ResourceList{}, getLocalStorageResourceList("1Gi"), api.ResourceList{}, api.ResourceList{}, api.ResourceList{}),
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: false,
+		},
 	}
 	for i := range successCases {
 		test := successCases[i]
 		t.Run(test.pod.Name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, test.podLevelResourcesEnabled)
+			if test.podLevelResourcesEphemeralStorageEnabled {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.NodeDeclaredFeatures:              true,
+					features.PodLevelResources:                 true,
+					features.PodLevelResourcesEphemeralStorage: true,
+				})
+			} else {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.PodLevelResources:                 test.podLevelResourcesEnabled,
+					features.PodLevelResourcesEphemeralStorage: false,
+				})
+			}
 			err := PodMutateLimitFunc(&test.limitRange, &test.pod)
 			if err != nil {
 				t.Errorf("Unexpected error for pod: %s, %v", test.pod.Name, err)
@@ -694,11 +724,49 @@ func TestPodLimitFunc(t *testing.T) {
 			limitRange:               createLimitRange(api.LimitTypePod, getComputeResourceList("", ""), getComputeResourceList("160m", "200Mi"), api.ResourceList{}, api.ResourceList{}, api.ResourceList{}),
 			podLevelResourcesEnabled: true,
 		},
+		{
+			pod: validPodWithPodLevelResources("pod-level-ephemeral-storage-exceeding-max", 2,
+				getResourceRequirements(getLocalStorageResourceList("200Mi"), getLocalStorageResourceList("300Mi")),
+				getResourceRequirements(getLocalStorageResourceList("500Mi"), getLocalStorageResourceList("2Gi")),
+			),
+			limitRange:                               createLimitRange(api.LimitTypePod, api.ResourceList{}, getLocalStorageResourceList("1Gi"), api.ResourceList{}, api.ResourceList{}, api.ResourceList{}),
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+		},
+		{
+			pod: validPodWithPodLevelResources("pod-level-ephemeral-storage-less-than-min", 2,
+				getResourceRequirements(getLocalStorageResourceList("300Mi"), getLocalStorageResourceList("400Mi")),
+				getResourceRequirements(getLocalStorageResourceList("200Mi"), getLocalStorageResourceList("800Mi")),
+			),
+			limitRange:                               createLimitRange(api.LimitTypePod, getLocalStorageResourceList("400Mi"), api.ResourceList{}, api.ResourceList{}, api.ResourceList{}, api.ResourceList{}),
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+		},
+		{
+			pod: validPodWithPodLevelResources("pod-level-ephemeral-storage-exceeding-ratio", 2,
+				getResourceRequirements(getLocalStorageResourceList("100Mi"), getLocalStorageResourceList("100Mi")),
+				getResourceRequirements(getLocalStorageResourceList("500Mi"), getLocalStorageResourceList("1Gi")),
+			),
+			limitRange:                               createLimitRange(api.LimitTypePod, api.ResourceList{}, api.ResourceList{}, api.ResourceList{}, api.ResourceList{}, getLocalStorageResourceList("1.5")),
+			podLevelResourcesEnabled:                 true,
+			podLevelResourcesEphemeralStorageEnabled: true,
+		},
 	}
 	for i := range errorCases {
 		test := errorCases[i]
 		t.Run(test.pod.Name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, test.podLevelResourcesEnabled)
+			if test.podLevelResourcesEphemeralStorageEnabled {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.NodeDeclaredFeatures:              true,
+					features.PodLevelResources:                 true,
+					features.PodLevelResourcesEphemeralStorage: true,
+				})
+			} else {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.PodLevelResources:                 test.podLevelResourcesEnabled,
+					features.PodLevelResourcesEphemeralStorage: false,
+				})
+			}
 			err := PodMutateLimitFunc(&test.limitRange, &test.pod)
 			if err != nil {
 				t.Errorf("Unexpected error for pod: %s, %v", test.pod.Name, err)
@@ -834,7 +902,11 @@ func TestLimitRangerAllowPodResize(t *testing.T) {
 // it no longer satisfies; a value the resize changes is checked as on create.
 func TestLimitRangerValidatePodResize(t *testing.T) {
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
-	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, true)
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.NodeDeclaredFeatures:              true,
+		features.PodLevelResources:                 true,
+		features.PodLevelResourcesEphemeralStorage: true,
+	})
 
 	cpu := func(request, limit string) api.ResourceRequirements {
 		return getResourceRequirements(getComputeResourceList(request, ""), getComputeResourceList(limit, ""))
@@ -990,6 +1062,18 @@ func TestLimitRangerValidatePodResize(t *testing.T) {
 			old:        new(validPodWithPodLevelResources("pod", 1, cpu("500m", "500m"), cpu("1", "1"))),
 			pod:        validPodWithPodLevelResources("pod", 1, cpu("500m", "500m"), cpu("3", "3")),
 			wantErr:    true,
+		},
+		{
+			name:       "unchanged pod-level ephemeral-storage above the max is not checked when cpu is resized",
+			limitRange: createLimitRange(api.LimitTypePod, api.ResourceList{}, getLocalStorageResourceList("1Gi"), api.ResourceList{}, api.ResourceList{}, api.ResourceList{}),
+			old: new(validPodWithPodLevelResources("pod", 1, cpu("500m", "500m"), api.ResourceRequirements{
+				Requests: api.ResourceList{api.ResourceCPU: resource.MustParse("500m"), api.ResourceEphemeralStorage: resource.MustParse("2Gi")},
+				Limits:   api.ResourceList{api.ResourceCPU: resource.MustParse("500m"), api.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+			})),
+			pod: validPodWithPodLevelResources("pod", 1, cpu("1", "1"), api.ResourceRequirements{
+				Requests: api.ResourceList{api.ResourceCPU: resource.MustParse("1"), api.ResourceEphemeralStorage: resource.MustParse("2Gi")},
+				Limits:   api.ResourceList{api.ResourceCPU: resource.MustParse("1"), api.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+			}),
 		},
 		{
 			name:       "create is checked in full",

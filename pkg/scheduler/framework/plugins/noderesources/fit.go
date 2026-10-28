@@ -94,6 +94,7 @@ type Fit struct {
 	ignoredResourceGroups                              sets.Set[string]
 	enableInPlacePodVerticalScaling                    bool
 	enablePodLevelResources                            bool
+	enablePodLevelResourcesEphemeralStorage            bool
 	enableDRAExtendedResource                          bool
 	enableInPlacePodLevelResourcesVerticalScaling      bool
 	enableInPlacePodVerticalScalingSchedulerPreemption bool
@@ -173,8 +174,9 @@ func (f *Fit) Name() string {
 // Filtering and scoring based on the container resources and overheads.
 func (pl *Fit) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
 	opts := ResourceRequestsOptions{
-		EnablePodLevelResources:   pl.enablePodLevelResources,
-		EnableDRAExtendedResource: pl.enableDRAExtendedResource,
+		EnablePodLevelResources:                 pl.enablePodLevelResources,
+		EnablePodLevelResourcesEphemeralStorage: pl.enablePodLevelResourcesEphemeralStorage,
+		EnableDRAExtendedResource:               pl.enableDRAExtendedResource,
 	}
 	if pl.enableDRAExtendedResource {
 		podRequest := computePodResourceRequest(pod, opts)
@@ -219,6 +221,7 @@ func NewFit(_ context.Context, plArgs runtime.Object, h fwk.Handle, fts feature.
 	if err != nil {
 		return nil, err
 	}
+	scorer.enablePodLevelResourcesEphemeralStorage = fts.EnablePodLevelResources && fts.EnablePodLevelResourcesEphemeralStorage
 	if fts.EnableDRAExtendedResource {
 		scorer.enableDRAExtendedResource = true
 		scorer.draManager = h.SharedDRAManager()
@@ -232,12 +235,13 @@ func NewFit(_ context.Context, plArgs runtime.Object, h fwk.Handle, fts feature.
 	}
 
 	pl := &Fit{
-		ignoredResources:                sets.New(args.IgnoredResources...),
-		ignoredResourceGroups:           sets.New(args.IgnoredResourceGroups...),
-		enableInPlacePodVerticalScaling: fts.EnableInPlacePodVerticalScaling,
-		handle:                          h,
-		enablePodLevelResources:         fts.EnablePodLevelResources,
-		enableDRAExtendedResource:       fts.EnableDRAExtendedResource,
+		ignoredResources:                        sets.New(args.IgnoredResources...),
+		ignoredResourceGroups:                   sets.New(args.IgnoredResourceGroups...),
+		enableInPlacePodVerticalScaling:         fts.EnableInPlacePodVerticalScaling,
+		handle:                                  h,
+		enablePodLevelResources:                 fts.EnablePodLevelResources,
+		enablePodLevelResourcesEphemeralStorage: fts.EnablePodLevelResourcesEphemeralStorage,
+		enableDRAExtendedResource:               fts.EnableDRAExtendedResource,
 
 		enableInPlacePodLevelResourcesVerticalScaling: fts.EnableInPlacePodLevelResourcesVerticalScaling,
 
@@ -254,6 +258,7 @@ func NewFit(_ context.Context, plArgs runtime.Object, h fwk.Handle, fts feature.
 		if err != nil {
 			return nil, err
 		}
+		placementScorer.enablePodLevelResourcesEphemeralStorage = fts.EnablePodLevelResources && fts.EnablePodLevelResourcesEphemeralStorage
 		pl.placementScorer = placementScorer
 	}
 
@@ -278,7 +283,10 @@ func computePodResourceRequest(pod *v1.Pod, opts ResourceRequestsOptions) *preFi
 
 // PreFilter invoked at the prefilter extension point.
 func (f *Fit) PreFilter(ctx context.Context, cycleState fwk.CycleState, pod *v1.Pod, nodes []fwk.NodeInfo) (*fwk.PreFilterResult, *fwk.Status) {
-	result := computePodResourceRequest(pod, ResourceRequestsOptions{EnablePodLevelResources: f.enablePodLevelResources})
+	result := computePodResourceRequest(pod, ResourceRequestsOptions{
+		EnablePodLevelResources:                 f.enablePodLevelResources,
+		EnablePodLevelResourcesEphemeralStorage: f.enablePodLevelResourcesEphemeralStorage,
+	})
 
 	cycleState.Write(preFilterStateKey, result)
 	return nil, nil
@@ -432,7 +440,12 @@ func (f *Fit) haveEnoughRelevantResourcesDecreased(targetPod *v1.Pod, originalPo
 
 	// the other pod was scheduled, so modification or deletion may free up some resources.
 	originalMaxResourceReq, modifiedMaxResourceReq := &framework.Resource{}, &framework.Resource{}
-	opts := resource.PodResourcesOptions{UseStatusResources: f.enableInPlacePodVerticalScaling, InPlacePodLevelResourcesVerticalScalingEnabled: f.enableInPlacePodLevelResourcesVerticalScaling}
+	opts := resource.PodResourcesOptions{
+		UseStatusResources:                             f.enableInPlacePodVerticalScaling,
+		SkipPodLevelResources:                          !f.enablePodLevelResources,
+		PodLevelResourcesEphemeralStorageEnabled:       f.enablePodLevelResourcesEphemeralStorage,
+		InPlacePodLevelResourcesVerticalScalingEnabled: f.enableInPlacePodLevelResourcesVerticalScaling,
+	}
 	originalMaxResourceReq.SetMaxResource(resource.PodRequests(originalPod, opts))
 	modifiedMaxResourceReq.SetMaxResource(resource.PodRequests(modifiedPod, opts))
 
@@ -486,8 +499,9 @@ func (f *Fit) isSchedulableAfterNodeChange(logger klog.Logger, pod *v1.Pod, oldO
 	}
 
 	opts := ResourceRequestsOptions{
-		EnablePodLevelResources:   f.enablePodLevelResources,
-		EnableDRAExtendedResource: f.enableDRAExtendedResource,
+		EnablePodLevelResources:                 f.enablePodLevelResources,
+		EnablePodLevelResourcesEphemeralStorage: f.enablePodLevelResourcesEphemeralStorage,
+		EnableDRAExtendedResource:               f.enableDRAExtendedResource,
 	}
 
 	// Leaving in the queue, since the pod won't fit into the modified node anyway.
@@ -517,6 +531,10 @@ func (f *Fit) isSchedulableAfterDeviceClassEvent(logger klog.Logger, pod *v1.Pod
 	if err != nil {
 		return fwk.Queue, err
 	}
+	podResOpts := resource.PodResourcesOptions{
+		SkipPodLevelResources:                    !f.enablePodLevelResources,
+		PodLevelResourcesEphemeralStorageEnabled: f.enablePodLevelResourcesEphemeralStorage,
+	}
 	if originalClass != nil {
 		if ptr.Deref(originalClass.Spec.ExtendedResourceName, "") == ptr.Deref(modifiedClass.Spec.ExtendedResourceName, "") {
 			logger.V(5).Info("device class has identical extended resource name", "pod", klog.KObj(pod), "deviceclass", klog.KObj(modifiedClass))
@@ -524,14 +542,14 @@ func (f *Fit) isSchedulableAfterDeviceClassEvent(logger klog.Logger, pod *v1.Pod
 		}
 	} else {
 		// only check implicit extended resource name for Add, as device class name does not change during Update.
-		reqs := resource.PodRequests(pod, resource.PodResourcesOptions{})
+		reqs := resource.PodRequests(pod, podResOpts)
 		if _, ok := reqs[v1.ResourceName(resourceapi.ResourceDeviceClassPrefix+modifiedClass.Name)]; ok {
 			logger.V(5).Info("device class was added, and may now fit the pod's resource requests", "pod", klog.KObj(pod), "deviceclass", klog.KObj(modifiedClass))
 			return fwk.Queue, nil
 		}
 	}
 	if modifiedClass.Spec.ExtendedResourceName != nil {
-		reqs := resource.PodRequests(pod, resource.PodResourcesOptions{})
+		reqs := resource.PodRequests(pod, podResOpts)
 		if _, ok := reqs[v1.ResourceName(*modifiedClass.Spec.ExtendedResourceName)]; ok {
 			logger.V(5).Info("device class was created or updated, and may fit the pod's resoruce requests", "pod", klog.KObj(pod), "deviceclass", klog.KObj(modifiedClass))
 			return fwk.Queue, nil
@@ -611,6 +629,7 @@ func (f *Fit) Filter(ctx context.Context, cycleState fwk.CycleState, pod *v1.Pod
 
 	opts := ResourceRequestsOptions{
 		EnablePodLevelResources:                            f.enablePodLevelResources,
+		EnablePodLevelResourcesEphemeralStorage:            f.enablePodLevelResourcesEphemeralStorage,
 		EnableDRAExtendedResource:                          f.enableDRAExtendedResource,
 		EnableInPlacePodVerticalScalingSchedulerPreemption: f.enableInPlacePodVerticalScalingSchedulerPreemption,
 	}
