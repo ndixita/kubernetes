@@ -716,6 +716,115 @@ func Test_AddPodToVolume_WithEmptyDirSizeLimit(t *testing.T) {
 	verifyDesiredSizeLimitInVolumeDsw(t, pod3Name, pod3DesiredSizeLimitMap, dsw)
 }
 
+func Test_AddPodToVolume_WithPodLevelEphemeralStorageLimit(t *testing.T) {
+	quantity1Gi := resource.MustParse("1Gi")
+	quantity2Gi := resource.MustParse("2Gi")
+	quantity3Gi := resource.MustParse("3Gi")
+	quantity4Gi := resource.MustParse("4Gi")
+	quantity8Gi := resource.MustParse("8Gi")
+
+	tests := []struct {
+		name                            string
+		podLevelEphemeralStorageEnabled bool
+		desiredSizeLimitMap             map[string]*resource.Quantity
+	}{
+		{
+			name:                            "pod-level ephemeral-storage limit caps emptyDir sizeLimit when gate enabled",
+			podLevelEphemeralStorageEnabled: true,
+			desiredSizeLimitMap: map[string]*resource.Quantity{
+				"emptyDirSmaller": &quantity1Gi,
+				"emptyDirLarger":  &quantity2Gi,
+				"emptyDirUnset":   &quantity2Gi,
+				"emptyDirMemory":  nil,
+			},
+		},
+		{
+			name:                            "pod-level ephemeral-storage limit ignored when gate disabled",
+			podLevelEphemeralStorageEnabled: false,
+			desiredSizeLimitMap: map[string]*resource.Quantity{
+				"emptyDirSmaller": &quantity1Gi,
+				"emptyDirLarger":  &quantity3Gi,
+				"emptyDirUnset":   &quantity8Gi,
+				"emptyDirMemory":  nil,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.podLevelEphemeralStorageEnabled {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.NodeDeclaredFeatures:              true,
+					features.PodLevelResources:                 true,
+					features.PodLevelResourcesEphemeralStorage: true,
+				})
+			} else {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.PodLevelResources:                 true,
+					features.PodLevelResourcesEphemeralStorage: false,
+				})
+			}
+
+			logger, _ := ktesting.NewTestContext(t)
+			volumePluginMgr, _ := volumetesting.GetTestKubeletVolumePluginMgr(t)
+			seLinuxTranslator := util.NewFakeSELinuxLabelTranslator()
+			dsw := NewDesiredStateOfWorld(volumePluginMgr, seLinuxTranslator)
+
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "plr-pod",
+					UID:  "plrpoduid",
+				},
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceEphemeralStorage: quantity2Gi,
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Resources: v1.ResourceRequirements{
+								Limits: v1.ResourceList{v1.ResourceEphemeralStorage: quantity4Gi},
+							},
+						},
+						{
+							Resources: v1.ResourceRequirements{
+								Limits: v1.ResourceList{v1.ResourceEphemeralStorage: quantity4Gi},
+							},
+						},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name:         "emptyDirSmaller",
+							VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{SizeLimit: &quantity1Gi}},
+						},
+						{
+							Name:         "emptyDirLarger",
+							VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{SizeLimit: &quantity3Gi}},
+						},
+						{
+							Name:         "emptyDirUnset",
+							VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}},
+						},
+						{
+							Name:         "emptyDirMemory",
+							VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{Medium: v1.StorageMediumMemory, SizeLimit: &quantity3Gi}},
+						},
+					},
+				},
+			}
+			podName := util.GetUniquePodName(pod)
+			for i := range pod.Spec.Volumes {
+				volumeSpec := &volume.Spec{Volume: &pod.Spec.Volumes[i]}
+				if _, err := dsw.AddPodToVolume(logger, podName, pod, volumeSpec, volumeSpec.Name(), "", nil); err != nil {
+					t.Fatalf("AddPodToVolume failed: %v", err)
+				}
+			}
+			verifyDesiredSizeLimitInVolumeDsw(t, podName, tc.desiredSizeLimitMap, dsw)
+		})
+	}
+}
+
 // Calls AddPodToVolume() in an empty DSW with various SELinux settings / access modes.
 func Test_AddPodToVolume_SELinuxSinglePod(t *testing.T) {
 	logger, _ := ktesting.NewTestContext(t)
@@ -1608,7 +1717,8 @@ func verifyDesiredSizeLimitInVolumeDsw(
 		}
 		for _, v := range volumesToMount {
 			if v.VolumeSpec.Name() == volumeName && v.PodName == expectedPodName {
-				if v.DesiredSizeLimit == nil || v.DesiredSizeLimit.Cmp(*expectedDesiredSize) != 0 {
+				if (expectedDesiredSize == nil) != (v.DesiredSizeLimit == nil) ||
+					(expectedDesiredSize != nil && v.DesiredSizeLimit.Cmp(*expectedDesiredSize) != 0) {
 					t.Fatalf(
 						"Found volume %v in the list of VolumesToMount, but DesiredSizeLimit incorrect. Expected: <%v> Actual: <%v>",
 						volumeName,

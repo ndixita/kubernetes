@@ -24,7 +24,7 @@ import (
 )
 
 func isPodLevelResourcesSupported(pod *v1.Pod) PodAdmitResult {
-	if resource.IsPodLevelResourcesSet(pod) {
+	if resource.IsPodLevelResourcesSetWithOpts(pod, resource.PodResourcesOptions{PodLevelResourcesEphemeralStorageEnabled: true}) {
 		return PodAdmitResult{
 			Admit:   false,
 			Reason:  PodLevelResourcesNotAdmittedReason,
@@ -32,4 +32,8 @@ func isPodLevelResourcesSupported(pod *v1.Pod) PodAdmitResult {
 		}
 	}
 	return PodAdmitResult{Admit: true}
+}
+
+func isPodLevelResourcesSupportedForAttrs(attrs *PodAdmitAttributes) PodAdmitResult {
+	return isPodLevelResourcesSupported(attrs.Pod)
 }

@@ -31,6 +31,9 @@ type PodAdmitAttributes struct {
 	OtherPods []*v1.Pod
 	// the operation being performed; either "add" or "resize"
 	Operation Operation
+	// AlreadyAllocated indicates that the pod already has allocated resources recorded
+	// by the kubelet (for example, when re-admitting an existing pod across kubelet restart).
+	AlreadyAllocated bool
 }
 
 // Operation represents the type of operation being performed on a pod.

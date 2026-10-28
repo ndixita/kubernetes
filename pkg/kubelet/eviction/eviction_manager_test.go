@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	goruntime "runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -3294,5 +3295,220 @@ func TestContainerEphemeralStorageLimitEvictionForRestartableInitContainers(t *t
 	}
 	if len(evictedPods) != 1 || evictedPods[0].Name != pod.Name {
 		t.Fatalf("Expected evicted pod %q, got %v", pod.Name, evictedPods)
+	}
+}
+
+func TestPodLevelEphemeralStorageLimitEvictions(t *testing.T) {
+	halfGi := resource.MustParse("512Mi")
+
+	tests := []struct {
+		name                            string
+		podLevelLimit                   string
+		containerLimits                 []string
+		emptyDirSizeLimit               *resource.Quantity
+		rootFsUsed                      string
+		logsFsUsed                      string
+		localVolumeUsed                 string
+		localStorageCapacityIsolation   bool
+		podLevelEphemeralStorageEnabled bool
+		expectEviction                  bool
+		expectedMessageSubstr           string
+	}{
+		{
+			name:                            "pod-level ephemeral-storage limit exceeded emits pod-level eviction message",
+			podLevelLimit:                   "2Gi",
+			containerLimits:                 []string{"", ""},
+			rootFsUsed:                      "1Gi",
+			logsFsUsed:                      "512Mi",
+			localVolumeUsed:                 "1Gi",
+			localStorageCapacityIsolation:   true,
+			podLevelEphemeralStorageEnabled: true,
+			expectEviction:                  true,
+			expectedMessageSubstr:           "exceeds pod-level limit (2Gi)",
+		},
+		{
+			name:                            "legacy container-sum ephemeral-storage limit preserves legacy eviction message",
+			containerLimits:                 []string{"1Gi", "1Gi"},
+			rootFsUsed:                      "1Gi",
+			logsFsUsed:                      "512Mi",
+			localVolumeUsed:                 "1Gi",
+			localStorageCapacityIsolation:   true,
+			podLevelEphemeralStorageEnabled: true,
+			expectEviction:                  true,
+			expectedMessageSubstr:           "exceeds the total limit of containers 2Gi",
+		},
+		{
+			name:                            "emptyDir.sizeLimit eviction takes precedence over pod-level limit",
+			podLevelLimit:                   "4Gi",
+			containerLimits:                 []string{""},
+			emptyDirSizeLimit:               &halfGi,
+			rootFsUsed:                      "100Mi",
+			logsFsUsed:                      "0",
+			localVolumeUsed:                 "1Gi",
+			localStorageCapacityIsolation:   true,
+			podLevelEphemeralStorageEnabled: true,
+			expectEviction:                  true,
+			expectedMessageSubstr:           "Usage of EmptyDir volume \"scratch\" exceeds the limit \"512Mi\"",
+		},
+		{
+			name:                            "container limit eviction triggers when container exceeds its limit within pod-level limit",
+			podLevelLimit:                   "4Gi",
+			containerLimits:                 []string{"512Mi"},
+			rootFsUsed:                      "1Gi",
+			logsFsUsed:                      "0",
+			localVolumeUsed:                 "0",
+			localStorageCapacityIsolation:   true,
+			podLevelEphemeralStorageEnabled: true,
+			expectEviction:                  true,
+			expectedMessageSubstr:           "Container c-0 exceeded its local ephemeral storage limit \"512Mi\"",
+		},
+		{
+			name:                            "pod-level ephemeral-storage limit eviction suppressed when localStorageCapacityIsolation is false",
+			podLevelLimit:                   "1Gi",
+			containerLimits:                 []string{""},
+			rootFsUsed:                      "2Gi",
+			logsFsUsed:                      "0",
+			localVolumeUsed:                 "0",
+			localStorageCapacityIsolation:   false,
+			podLevelEphemeralStorageEnabled: true,
+			expectEviction:                  false,
+		},
+		{
+			name:                            "rollback: pod-level ephemeral-storage limit ignored when PodLevelResourcesEphemeralStorage disabled",
+			podLevelLimit:                   "1Gi",
+			containerLimits:                 []string{"4Gi"},
+			rootFsUsed:                      "2Gi",
+			logsFsUsed:                      "0",
+			localVolumeUsed:                 "0",
+			localStorageCapacityIsolation:   true,
+			podLevelEphemeralStorageEnabled: false,
+			expectEviction:                  false,
+		},
+		{
+			name:                            "zero pod-level ephemeral-storage limit means unlimited and does not evict",
+			podLevelLimit:                   "0",
+			containerLimits:                 []string{""},
+			rootFsUsed:                      "4096",
+			logsFsUsed:                      "0",
+			localVolumeUsed:                 "0",
+			localStorageCapacityIsolation:   true,
+			podLevelEphemeralStorageEnabled: true,
+			expectEviction:                  false,
+		},
+		{
+			name:                            "zero container ephemeral-storage limits sum does not evict when gate is disabled",
+			containerLimits:                 []string{"0", "0"},
+			rootFsUsed:                      "4096",
+			logsFsUsed:                      "0",
+			localVolumeUsed:                 "0",
+			localStorageCapacityIsolation:   true,
+			podLevelEphemeralStorageEnabled: false,
+			expectEviction:                  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			if tc.podLevelEphemeralStorageEnabled {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.NodeDeclaredFeatures:              true,
+					features.PodLevelResources:                 true,
+					features.PodLevelResourcesEphemeralStorage: true,
+				})
+			} else {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.PodLevelResources:                 true,
+					features.PodLevelResourcesEphemeralStorage: false,
+				})
+			}
+
+			var containers []v1.Container
+			for i, lim := range tc.containerLimits {
+				containers = append(containers, newContainer(fmt.Sprintf("c-%d", i), nil, newResourceList("", "", lim)))
+			}
+			volumes := []v1.Volume{{
+				Name: "scratch",
+				VolumeSource: v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{
+						SizeLimit: tc.emptyDirSizeLimit,
+					},
+				},
+			}}
+			pod := newPod("plr-storage-pod", defaultPriority, containers, volumes)
+			if tc.podLevelLimit != "" {
+				pod.Spec.Resources = &v1.ResourceRequirements{
+					Limits: newResourceList("", "", tc.podLevelLimit),
+				}
+			}
+
+			rootQty := parseQuantity(tc.rootFsUsed)
+			logsQty := parseQuantity(tc.logsFsUsed)
+			localVolQty := parseQuantity(tc.localVolumeUsed)
+			podStat := newPodDiskStats(pod, rootQty, logsQty, localVolQty)
+			// Override container stats so only c-0 carries rootFsUsed/logsFsUsed (avoiding N-container multiplication in newPodDiskStats).
+			rootBytes := uint64(rootQty.Value())
+			logsBytes := uint64(logsQty.Value())
+			zeroBytes := uint64(0)
+			podStat.Containers = make([]statsapi.ContainerStats, len(containers))
+			for i, c := range containers {
+				if i == 0 {
+					podStat.Containers[i] = statsapi.ContainerStats{
+						Name:   c.Name,
+						Rootfs: &statsapi.FsStats{UsedBytes: &rootBytes},
+						Logs:   &statsapi.FsStats{UsedBytes: &logsBytes},
+					}
+				} else {
+					podStat.Containers[i] = statsapi.ContainerStats{
+						Name:   c.Name,
+						Rootfs: &statsapi.FsStats{UsedBytes: &zeroBytes},
+						Logs:   &statsapi.FsStats{UsedBytes: &zeroBytes},
+					}
+				}
+			}
+			totalUsed := rootBytes + logsBytes + uint64(localVolQty.Value())
+			podStat.EphemeralStorage = &statsapi.FsStats{UsedBytes: &totalUsed}
+
+			diskStat := diskStats{
+				rootFsAvailableBytes:  "10Gi",
+				imageFsAvailableBytes: "10Gi",
+				podStats:              map[*v1.Pod]statsapi.PodStats{pod: podStat},
+			}
+			summaryProvider := &fakeSummaryProvider{result: makeDiskStats(diskStat)}
+			podKiller := &mockPodKiller{}
+			mgr := &managerImpl{
+				clock:                         testingclock.NewFakeClock(time.Now()),
+				killPodFunc:                   podKiller.killPodNow,
+				imageGC:                       &mockDiskGC{err: nil},
+				containerGC:                   &mockDiskGC{err: nil},
+				config:                        Config{MaxPodGracePeriodSeconds: 5, PressureTransitionPeriod: time.Minute * 5},
+				recorder:                      &record.FakeRecorder{},
+				summaryProvider:               summaryProvider,
+				nodeRef:                       &v1.ObjectReference{Kind: "Node", Name: "test", UID: types.UID("test")},
+				nodeConditionsLastObservedAt:  nodeConditionsObservedAt{},
+				thresholdsFirstObservedAt:     thresholdsObservedAt{},
+				localStorageCapacityIsolation: tc.localStorageCapacityIsolation,
+				dedicatedImageFs:              ptr.To(false),
+			}
+
+			_, err := mgr.synchronize(tCtx, &mockDiskInfoProvider{dedicatedImageFs: ptr.To(false)}, func() []*v1.Pod { return []*v1.Pod{pod} })
+			if err != nil {
+				t.Fatalf("unexpected synchronize error: %v", err)
+			}
+			if !tc.expectEviction {
+				if podKiller.pod != nil {
+					t.Fatalf("expected pod not to be evicted, got evicted pod %q", podKiller.pod.Name)
+				}
+				return
+			}
+			if podKiller.pod == nil {
+				t.Fatalf("expected pod to be evicted, got nil")
+			}
+			var status v1.PodStatus
+			podKiller.statusFn(&status)
+			if !strings.Contains(status.Message, tc.expectedMessageSubstr) {
+				t.Errorf("expected eviction status message %q to contain %q", status.Message, tc.expectedMessageSubstr)
+			}
+		})
 	}
 }

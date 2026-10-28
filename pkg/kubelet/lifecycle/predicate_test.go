@@ -872,3 +872,87 @@ func TestPodAdmissionBasedOnSupplementalGroupsPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestGeneralFilterPodLevelEphemeralStorage(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine1"},
+		Status:     v1.NodeStatus{Capacity: makeResources(8000, 20, 32, 0, 20, 0), Allocatable: makeAllocatableResources(8000, 20, 32, 0, 20, 0)},
+	}
+
+	makePod := func(podStorage, ctrStorage int64) *v1.Pod {
+		pod := newResourcePod(v1.ResourceList{
+			v1.ResourceEphemeralStorage: *resource.NewQuantity(ctrStorage, resource.BinarySI),
+		})
+		pod.Spec.Resources = &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceEphemeralStorage: *resource.NewQuantity(podStorage, resource.BinarySI),
+			},
+		}
+		return pod
+	}
+
+	tests := []struct {
+		name                            string
+		pod                             *v1.Pod
+		podLevelEphemeralStorageEnabled bool
+		want                            []PredicateFailureReason
+	}{
+		{
+			name:                            "pod-level ephemeral-storage exceeding allocatable fails with OutOfephemeral-storage when enabled",
+			pod:                             makePod(25, 5),
+			podLevelEphemeralStorageEnabled: true,
+			want: []PredicateFailureReason{
+				&InsufficientResourceError{ResourceName: v1.ResourceEphemeralStorage, Requested: 25, Capacity: 20},
+			},
+		},
+		{
+			name:                            "pod-level ephemeral-storage within allocatable fits when enabled",
+			pod:                             makePod(15, 5),
+			podLevelEphemeralStorageEnabled: true,
+			want:                            nil,
+		},
+		{
+			name:                            "pod-level ephemeral-storage ignored when PodLevelResourcesEphemeralStorage disabled",
+			pod:                             makePod(25, 5),
+			podLevelEphemeralStorageEnabled: false,
+			want:                            nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.podLevelEphemeralStorageEnabled {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.NodeDeclaredFeatures:              true,
+					features.PodLevelResources:                 true,
+					features.PodLevelResourcesEphemeralStorage: true,
+				})
+			} else {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.PodLevelResources:                 true,
+					features.PodLevelResourcesEphemeralStorage: false,
+				})
+			}
+			nodeInfo := schedulerframework.NewNodeInfo()
+			nodeInfo.SetNode(node)
+			got := generalFilter(tCtx.Logger(), tc.pod, nodeInfo)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("unexpected failure reasons (-want, +got):\n%s", diff)
+			}
+			handler := NewPredicateAdmitHandler(
+				func(ctx context.Context, useCache bool) (*v1.Node, error) { return node, nil },
+				NewAdmissionFailureHandlerStub(),
+				func(*schedulerframework.NodeInfo, *PodAdmitAttributes) error { return nil },
+			)
+			admitResult := handler.Admit(tCtx, &PodAdmitAttributes{Pod: tc.pod})
+			if len(tc.want) > 0 {
+				if admitResult.Admit || admitResult.Reason != OutOfEphemeralStorage {
+					t.Errorf("expected Admit=false with reason %q, got %+v", OutOfEphemeralStorage, admitResult)
+				}
+			} else if !admitResult.Admit {
+				t.Errorf("expected Admit=true, got %+v", admitResult)
+			}
+		})
+	}
+}

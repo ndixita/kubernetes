@@ -146,3 +146,98 @@ func getPodWithPodLevelResources(plCPULimit, plMemoryLimit, clCPULimit, clMemory
 	pod.Spec.Resources = &resources
 	return pod
 }
+
+func TestPodEphemeralStorageLimitsDefaulting(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	tk := newTestKubelet(t, true)
+	defer tk.Cleanup()
+	tk.kubelet.nodeLister = &testNodeLister{
+		nodes: []*v1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: string(tk.kubelet.nodeName),
+				},
+				Status: v1.NodeStatus{
+					Allocatable: v1.ResourceList{
+						v1.ResourceCPU:              resource.MustParse("6"),
+						v1.ResourceMemory:           resource.MustParse("4Gi"),
+						v1.ResourceEphemeralStorage: resource.MustParse("20Gi"),
+					},
+				},
+			},
+		},
+	}
+
+	makeStoragePod := func(plCPULimit, plStorageLimit, clCPULimit, clMemoryLimit, clStorageLimit string) *v1.Pod {
+		p := getPod(clCPULimit, clMemoryLimit)
+		if clStorageLimit != "" {
+			if p.Spec.Containers[0].Resources.Limits == nil {
+				p.Spec.Containers[0].Resources.Limits = make(v1.ResourceList)
+			}
+			p.Spec.Containers[0].Resources.Limits[v1.ResourceEphemeralStorage] = resource.MustParse(clStorageLimit)
+		}
+		if plCPULimit != "" || plStorageLimit != "" {
+			p.Spec.Resources = &v1.ResourceRequirements{Limits: make(v1.ResourceList)}
+			if plCPULimit != "" {
+				p.Spec.Resources.Limits[v1.ResourceCPU] = resource.MustParse(plCPULimit)
+			}
+			if plStorageLimit != "" {
+				p.Spec.Resources.Limits[v1.ResourceEphemeralStorage] = resource.MustParse(plStorageLimit)
+			}
+		}
+		return p
+	}
+
+	cases := []struct {
+		name                            string
+		pod                             *v1.Pod
+		expected                        *v1.Pod
+		podLevelResourcesEnabled        bool
+		podLevelEphemeralStorageEnabled bool
+	}{
+		{
+			name:                            "pod-level ephemeral-storage only defaults container downward API limit when gate enabled",
+			pod:                             makeStoragePod("", "5Gi", "", "", ""),
+			expected:                        makeStoragePod("", "5Gi", "6", "4Gi", "5Gi"),
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: true,
+		},
+		{
+			name:                            "explicit container ephemeral-storage limit takes precedence over pod-level limit",
+			pod:                             makeStoragePod("", "5Gi", "", "", "2Gi"),
+			expected:                        makeStoragePod("", "5Gi", "6", "4Gi", "2Gi"),
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: true,
+		},
+		{
+			name:                            "pod-level ephemeral-storage limit ignored when PodLevelResourcesEphemeralStorage disabled",
+			pod:                             makeStoragePod("2", "5Gi", "", "", ""),
+			expected:                        makeStoragePod("2", "5Gi", "2", "4Gi", "20Gi"),
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: false,
+		},
+	}
+
+	as := assert.New(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.podLevelEphemeralStorageEnabled {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					kubefeatures.NodeDeclaredFeatures:              true,
+					kubefeatures.PodLevelResources:                 tc.podLevelResourcesEnabled,
+					kubefeatures.PodLevelResourcesEphemeralStorage: true,
+				})
+			} else {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					kubefeatures.PodLevelResources:                 tc.podLevelResourcesEnabled,
+					kubefeatures.PodLevelResourcesEphemeralStorage: false,
+				})
+			}
+			actual, _, err := tk.kubelet.defaultPodLimitsForDownwardAPI(tCtx, tc.pod, nil)
+			as.NoError(err, "failed to default pod limits: %v", err)
+			if !apiequality.Semantic.DeepEqual(tc.expected, actual) {
+				as.Fail("test case %q failed. Expected: %+v, Got: %+v", tc.name, tc.expected, actual)
+			}
+		})
+	}
+}

@@ -48,12 +48,15 @@ func (kl *Kubelet) defaultPodLimitsForDownwardAPI(ctx context.Context, pod *core
 		return nil, nil, fmt.Errorf("failed to find node object, expected a node")
 	}
 	allocatable := node.Status.Allocatable
-	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResources) && resourcehelper.IsPodLevelLimitsSet(pod) {
+	plrOpts := resourcehelper.PodResourcesOptions{
+		PodLevelResourcesEphemeralStorageEnabled: utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResourcesEphemeralStorage),
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResources) && resourcehelper.IsPodLevelLimitsSetWithOpts(pod, plrOpts) {
 		allocatable = allocatable.DeepCopy()
 		// Resources supported by the Downward API
 		for _, resource := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
 			// Skip resources not supported by Pod Level Resources
-			if !resourcehelper.IsSupportedPodLevelResource(resource) {
+			if !resourcehelper.IsSupportedPodLevelResourceWithOpts(resource, plrOpts) {
 				continue
 			}
 			if val, exists := pod.Spec.Resources.Limits[resource]; exists && !val.IsZero() {

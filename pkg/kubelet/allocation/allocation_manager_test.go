@@ -37,9 +37,12 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/component-base/featuregate"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
+	ndf "k8s.io/component-helpers/nodedeclaredfeatures"
+	ndftypes "k8s.io/component-helpers/nodedeclaredfeatures/types"
 	"k8s.io/klog/v2"
 	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/features"
@@ -4219,3 +4222,92 @@ func setupNonAllocatedCapacityTest(t *testing.T) (Manager, *v1.Pod, *v1.Pod, klo
 
 	return allocationManager, runningPod, pendingPod, logger
 }
+
+func TestAddPodCheckpointedStaticPodOnPodLevelEphemeralStorageRollback(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("PodLevelResources is only supported on Linux")
+	}
+	tCtx := ktesting.Init(t)
+	logger := klog.FromContext(tCtx)
+	checkpointDir := t.TempDir()
+
+	newStaticPod := func(uid types.UID, name string) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:       uid,
+				Name:      name,
+				Namespace: "default",
+				Annotations: map[string]string{
+					kubetypes.ConfigSourceAnnotationKey: kubetypes.FileSource,
+				},
+			},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{{Name: "app", Image: "pause"}},
+				Resources: &v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("1Gi")},
+				},
+			},
+			// Static pods are re-admitted from their manifest source with an empty PodStatus.
+			Status: v1.PodStatus{},
+		}
+	}
+
+	buildManager := func() Manager {
+		statusMgr := status.NewManager(&fake.Clientset{}, kubepod.NewBasicPodManager(), &statustest.FakePodDeletionSafetyProvider{}, kubeletutil.NewPodStartupLatencyTracker())
+		mgr := NewManager(
+			checkpointDir,
+			statusMgr,
+			func(context.Context, *v1.Pod) {},
+			func() []*v1.Pod { return nil },
+			func(types.UID) (*v1.Pod, bool) { return nil, false },
+			config.NewSourcesReady(func(sets.Set[string]) bool { return true }),
+			record.NewFakeRecorder(10),
+			logger,
+		)
+		fw := ndf.DefaultFramework
+		declared := fw.DiscoverNodeFeatures(&ndftypes.NodeConfiguration{
+			FeatureGates: ndfFeatureGateFunc(func(key string) bool {
+				return utilfeature.DefaultFeatureGate.Enabled(featuregate.Feature(key))
+			}),
+		})
+		nodeFeatures, err := fw.MapSorted(declared)
+		require.NoError(t, err)
+		mgr.AddPodAdmitHandlers(lifecycle.PodAdmitHandlers{
+			lifecycle.NewPodFeaturesAdmitHandler(),
+			lifecycle.NewDeclaredFeaturesAdmitHandler(fw, nodeFeatures, version.MustParse("1.38.0")),
+		})
+		return mgr
+	}
+
+	// Step 1: Admit and checkpoint static pod with PodLevelResourcesEphemeralStorage=true.
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.InPlacePodVerticalScaling:         true,
+		features.NodeDeclaredFeatures:              true,
+		features.PodLevelResources:                 true,
+		features.PodLevelResourcesEphemeralStorage: true,
+	})
+	existingStaticPod := newStaticPod("static-pod-existing", "static-existing")
+	initialMgr := buildManager()
+	ok, reason, msg := initialMgr.AddPod(tCtx, nil, existingStaticPod)
+	require.True(t, ok, "initial static pod admission should succeed: reason=%s msg=%s", reason, msg)
+
+	// Step 2: Simulate kubelet restart after rolling back PodLevelResourcesEphemeralStorage=false.
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.InPlacePodVerticalScaling:         true,
+		features.NodeDeclaredFeatures:              true,
+		features.PodLevelResources:                 true,
+		features.PodLevelResourcesEphemeralStorage: false,
+	})
+	restartedMgr := buildManager()
+	ok, reason, msg = restartedMgr.AddPod(tCtx, nil, existingStaticPod.DeepCopy())
+	require.True(t, ok, "previously checkpointed static pod must remain admitted across gate-off restart: reason=%s msg=%s", reason, msg)
+
+	// A brand-new static pod without an existing allocation checkpoint must be rejected when gate is off.
+	brandNewStaticPod := newStaticPod("static-pod-new", "static-new")
+	ok, _, _ = restartedMgr.AddPod(tCtx, nil, brandNewStaticPod)
+	require.False(t, ok, "brand-new static pod with pod-level ephemeral-storage must be rejected when gate is off")
+}
+
+type ndfFeatureGateFunc func(string) bool
+
+func (f ndfFeatureGateFunc) Enabled(key string) bool { return f(key) }

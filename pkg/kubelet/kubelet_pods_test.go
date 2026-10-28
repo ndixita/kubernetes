@@ -10168,6 +10168,49 @@ func TestRecordPodLevelResourcesAdmission(t *testing.T) {
 			testMetric(t, metrics.PodLevelResourcesAdmissionTotal.FQName(), expected)
 		})
 	}
+
+	t.Run("pod level ephemeral-storage only with gate enabled", func(t *testing.T) {
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.NodeDeclaredFeatures:              true,
+			features.PodLevelResources:                 true,
+			features.PodLevelResourcesEphemeralStorage: true,
+		})
+		metrics.PodLevelResourcesAdmissionTotal.Reset()
+		pod := &v1.Pod{
+			Spec: v1.PodSpec{
+				Resources: &v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+					},
+				},
+				Containers: []v1.Container{{Name: "c1"}},
+			},
+		}
+		recordPodLevelResourcesAdmission(pod)
+		expected := metricHeader + `kubelet_pod_level_resources_admission_total{config_mode="pod_level",qos_class="besteffort"} 1` + "\n"
+		testMetric(t, metrics.PodLevelResourcesAdmissionTotal.FQName(), expected)
+	})
+
+	t.Run("pod level ephemeral-storage only with gate disabled", func(t *testing.T) {
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.PodLevelResources:                 true,
+			features.PodLevelResourcesEphemeralStorage: false,
+		})
+		metrics.PodLevelResourcesAdmissionTotal.Reset()
+		pod := &v1.Pod{
+			Spec: v1.PodSpec{
+				Resources: &v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+					},
+				},
+				Containers: []v1.Container{{Name: "c1"}},
+			},
+		}
+		recordPodLevelResourcesAdmission(pod)
+		expected := metricHeader + `kubelet_pod_level_resources_admission_total{config_mode="",qos_class="besteffort"} 1` + "\n"
+		testMetric(t, metrics.PodLevelResourcesAdmissionTotal.FQName(), expected)
+	})
 }
 
 func TestMakeMountsBindMountOptions(t *testing.T) {

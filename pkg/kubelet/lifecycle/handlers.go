@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ndf "k8s.io/component-helpers/nodedeclaredfeatures"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
@@ -233,7 +235,25 @@ func NewPodFeaturesAdmitHandler() PodAdmitHandler {
 type podFeaturesAdmitHandler struct{}
 
 func (h *podFeaturesAdmitHandler) Admit(_ context.Context, attrs *PodAdmitAttributes) PodAdmitResult {
-	return isPodLevelResourcesSupported(attrs.Pod)
+	return isPodLevelResourcesSupportedForAttrs(attrs)
+}
+
+func isPodAlreadyAdmitted(attrs *PodAdmitAttributes) bool {
+	if attrs == nil {
+		return false
+	}
+	if attrs.Operation == ResizeOperation || attrs.AlreadyAllocated {
+		return true
+	}
+	if attrs.Pod == nil {
+		return false
+	}
+	status := &attrs.Pod.Status
+	return (status.Phase != "" && status.Phase != v1.PodPending) ||
+		status.StartTime != nil ||
+		len(status.InitContainerStatuses) > 0 ||
+		len(status.ContainerStatuses) > 0 ||
+		len(status.EphemeralContainerStatuses) > 0
 }
 
 // declaredFeaturesAdmitHandler is a PodAdmitHandler that checks a pod's feature requirements.
@@ -280,10 +300,23 @@ func (c *declaredFeaturesAdmitHandler) Admit(_ context.Context, attrs *PodAdmitA
 	}
 
 	if !matchResult.IsMatch {
+		unsatisfied := matchResult.UnsatisfiedRequirements
+		// Already-admitted pods (including Pending pods with started init containers and
+		// checkpointed static pods across kubelet restart, or in-place CPU/memory resizes)
+		// continue running when PodLevelResourcesEphemeralStorage is rolled back, falling
+		// back to container-level ephemeral-storage accounting.
+		if isPodAlreadyAdmitted(attrs) {
+			unsatisfied = slices.DeleteFunc(slices.Clone(unsatisfied), func(req string) bool {
+				return req == string(features.PodLevelResourcesEphemeralStorage)
+			})
+			if len(unsatisfied) == 0 {
+				return PodAdmitResult{Admit: true}
+			}
+		}
 		return PodAdmitResult{
 			Admit:   false,
 			Reason:  PodFeatureUnsupported,
-			Message: fmt.Sprintf("Pod requires node features that are not available: %s", strings.Join(matchResult.UnsatisfiedRequirements, ", ")),
+			Message: fmt.Sprintf("Pod requires node features that are not available: %s", strings.Join(unsatisfied, ", ")),
 		}
 	}
 

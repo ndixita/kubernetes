@@ -569,9 +569,16 @@ func (m *managerImpl) emptyDirLimitEviction(logger klog.Logger, podStats statsap
 }
 
 func (m *managerImpl) podEphemeralStorageLimitEviction(logger klog.Logger, podStats statsapi.PodStats, pod *v1.Pod) bool {
-	podLimits := resourcehelper.PodLimits(pod, resourcehelper.PodResourcesOptions{})
-	_, found := podLimits[v1.ResourceEphemeralStorage]
-	if !found {
+	podLevelResourcesEnabled := utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources)
+	podLevelEphemeralStorageEnabled := podLevelResourcesEnabled && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesEphemeralStorage)
+	podLimits := resourcehelper.PodLimits(pod, resourcehelper.PodResourcesOptions{
+		SkipPodLevelResources:                    !podLevelResourcesEnabled,
+		PodLevelResourcesEphemeralStorageEnabled: podLevelEphemeralStorageEnabled,
+	})
+	podEphemeralStorageLimit, found := podLimits[v1.ResourceEphemeralStorage]
+	// Use IsZero (matching containerEphemeralStorageLimitEviction) so a zero limit is treated
+	// as unlimited rather than evicting on baseline kubelet file overhead (e.g. /etc/hosts).
+	if !found || podEphemeralStorageLimit.IsZero() {
 		return false
 	}
 
@@ -580,10 +587,17 @@ func (m *managerImpl) podEphemeralStorageLimitEviction(logger klog.Logger, podSt
 	if podStats.EphemeralStorage != nil && podStats.EphemeralStorage.UsedBytes != nil {
 		podEphemeralStorageTotalUsage = resource.NewQuantity(int64(*podStats.EphemeralStorage.UsedBytes), resource.BinarySI)
 	}
-	podEphemeralStorageLimit := podLimits[v1.ResourceEphemeralStorage]
 	if podEphemeralStorageTotalUsage.Cmp(podEphemeralStorageLimit) > 0 {
-		// the total usage of pod exceeds the total size limit of containers, evict the pod
-		message := fmt.Sprintf(podEphemeralStorageMessageFmt, podEphemeralStorageLimit.String())
+		// the total usage of pod exceeds the pod-level limit or total size limit of containers, evict the pod
+		var message string
+		if podLevelEphemeralStorageEnabled && pod.Spec.Resources != nil {
+			if _, ok := pod.Spec.Resources.Limits[v1.ResourceEphemeralStorage]; ok {
+				message = fmt.Sprintf(podLevelEphemeralStorageMessageFmt, podEphemeralStorageTotalUsage.String(), podEphemeralStorageLimit.String())
+			}
+		}
+		if message == "" {
+			message = fmt.Sprintf(podEphemeralStorageMessageFmt, podEphemeralStorageLimit.String())
+		}
 		if m.evictPod(logger, pod, immediateEvictionGracePeriodSeconds, message, nil, nil) {
 			metrics.Evictions.WithLabelValues(signalEphemeralPodFsLimit).Inc()
 			return true
