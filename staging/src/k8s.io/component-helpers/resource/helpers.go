@@ -49,6 +49,10 @@ type PodResourcesOptions struct {
 	// This MUST be false if the InPlacePodLevelResourcesVerticalScaling
 	// feature is not enabled.
 	InPlacePodLevelResourcesVerticalScalingEnabled bool
+	// PodLevelResourcesEphemeralStorageEnabled indicates whether pod-level ephemeral-storage
+	// requests and limits should be considered when evaluating pod resources.
+	// This MUST be false if the PodLevelResourcesEphemeralStorage feature is not enabled.
+	PodLevelResourcesEphemeralStorageEnabled bool
 	// ExcludeOverhead controls if pod overhead is excluded from the calculation.
 	ExcludeOverhead bool
 	// NonMissingContainerRequests if provided will replace any missing container level requests for the specified resources
@@ -66,22 +70,54 @@ type PodResourcesOptions struct {
 
 var supportedPodLevelResources = sets.New(v1.ResourceCPU, v1.ResourceMemory)
 
+// SupportedPodLevelResources returns the default set of supported pod-level resource names.
+// Feature-gated resources such as ephemeral-storage are excluded unless
+// SupportedPodLevelResourcesWithOpts is called with PodLevelResourcesEphemeralStorageEnabled: true.
 func SupportedPodLevelResources() sets.Set[v1.ResourceName] {
-	return supportedPodLevelResources.Clone().Insert(v1.ResourceHugePagesPrefix)
+	return SupportedPodLevelResourcesWithOpts(PodResourcesOptions{})
 }
 
-// IsSupportedPodLevelResources checks if a given resource is supported by pod-level
-// resource management through the PodLevelResources feature. Returns true if
-// the resource is supported.
+// SupportedPodLevelResourcesWithOpts returns the set of supported pod-level resource names
+// according to the supplied PodResourcesOptions.
+func SupportedPodLevelResourcesWithOpts(opts PodResourcesOptions) sets.Set[v1.ResourceName] {
+	res := supportedPodLevelResources.Clone().Insert(v1.ResourceHugePagesPrefix)
+	if opts.PodLevelResourcesEphemeralStorageEnabled {
+		res.Insert(v1.ResourceEphemeralStorage)
+	}
+	return res
+}
+
+// IsSupportedPodLevelResource checks if a given resource is supported by pod-level
+// resource management through the PodLevelResources feature. Feature-gated resources
+// such as ephemeral-storage are excluded unless IsSupportedPodLevelResourceWithOpts
+// is called with PodLevelResourcesEphemeralStorageEnabled: true.
 func IsSupportedPodLevelResource(name v1.ResourceName) bool {
+	return IsSupportedPodLevelResourceWithOpts(name, PodResourcesOptions{})
+}
+
+// IsSupportedPodLevelResourceWithOpts checks if a given resource is supported by pod-level
+// resource management according to the supplied PodResourcesOptions.
+func IsSupportedPodLevelResourceWithOpts(name v1.ResourceName, opts PodResourcesOptions) bool {
+	if opts.PodLevelResourcesEphemeralStorageEnabled && name == v1.ResourceEphemeralStorage {
+		return true
+	}
 	return supportedPodLevelResources.Has(name) || strings.HasPrefix(string(name), v1.ResourceHugePagesPrefix)
 }
 
-// IsPodLevelResourcesSet check if PodLevelResources pod-level resources are set.
-// It returns true if either the Requests or Limits maps are non-empty.
+// IsPodLevelResourcesSet checks if PodLevelResources pod-level resources are set.
+// It returns true if either the Requests or Limits maps contain at least one default
+// supported pod-level resource. Feature-gated resources such as ephemeral-storage
+// are excluded unless IsPodLevelResourcesSetWithOpts is called with
+// PodLevelResourcesEphemeralStorageEnabled: true.
 // Note: keep this in sync with k8s.io/kubernetes/pkg/apis/core/helper.IsPodLevelResourcesSet
 func IsPodLevelResourcesSet(pod *v1.Pod) bool {
-	if pod.Spec.Resources == nil {
+	return IsPodLevelResourcesSetWithOpts(pod, PodResourcesOptions{})
+}
+
+// IsPodLevelResourcesSetWithOpts checks if supported pod-level resources are set according to opts.
+// Note: keep this in sync with k8s.io/kubernetes/pkg/apis/core/helper.IsPodLevelResourcesSetWithOpts
+func IsPodLevelResourcesSetWithOpts(pod *v1.Pod, opts PodResourcesOptions) bool {
+	if opts.SkipPodLevelResources || pod.Spec.Resources == nil {
 		return false
 	}
 
@@ -90,13 +126,13 @@ func IsPodLevelResourcesSet(pod *v1.Pod) bool {
 	}
 
 	for resourceName := range pod.Spec.Resources.Requests {
-		if IsSupportedPodLevelResource(resourceName) {
+		if IsSupportedPodLevelResourceWithOpts(resourceName, opts) {
 			return true
 		}
 	}
 
 	for resourceName := range pod.Spec.Resources.Limits {
-		if IsSupportedPodLevelResource(resourceName) {
+		if IsSupportedPodLevelResourceWithOpts(resourceName, opts) {
 			return true
 		}
 	}
@@ -105,9 +141,16 @@ func IsPodLevelResourcesSet(pod *v1.Pod) bool {
 }
 
 // IsPodLevelRequestsSet checks if pod-level requests are set. It returns true if
-// Requests map is non-empty.
+// Requests map contains at least one default supported pod-level resource.
+// Feature-gated resources such as ephemeral-storage are excluded unless
+// IsPodLevelRequestsSetWithOpts is called with PodLevelResourcesEphemeralStorageEnabled: true.
 func IsPodLevelRequestsSet(pod *v1.Pod) bool {
-	if pod.Spec.Resources == nil {
+	return IsPodLevelRequestsSetWithOpts(pod, PodResourcesOptions{})
+}
+
+// IsPodLevelRequestsSetWithOpts checks if supported pod-level requests are set according to opts.
+func IsPodLevelRequestsSetWithOpts(pod *v1.Pod, opts PodResourcesOptions) bool {
+	if opts.SkipPodLevelResources || pod.Spec.Resources == nil {
 		return false
 	}
 
@@ -116,7 +159,7 @@ func IsPodLevelRequestsSet(pod *v1.Pod) bool {
 	}
 
 	for resourceName := range pod.Spec.Resources.Requests {
-		if IsSupportedPodLevelResource(resourceName) {
+		if IsSupportedPodLevelResourceWithOpts(resourceName, opts) {
 			return true
 		}
 	}
@@ -125,9 +168,16 @@ func IsPodLevelRequestsSet(pod *v1.Pod) bool {
 }
 
 // IsPodLevelLimitsSet checks if pod-level limits are set. It returns true if
-// Limits map is non-empty and contains at least one supported pod-level resource.
+// Limits map contains at least one default supported pod-level resource.
+// Feature-gated resources such as ephemeral-storage are excluded unless
+// IsPodLevelLimitsSetWithOpts is called with PodLevelResourcesEphemeralStorageEnabled: true.
 func IsPodLevelLimitsSet(pod *v1.Pod) bool {
-	if pod.Spec.Resources == nil {
+	return IsPodLevelLimitsSetWithOpts(pod, PodResourcesOptions{})
+}
+
+// IsPodLevelLimitsSetWithOpts checks if supported pod-level limits are set according to opts.
+func IsPodLevelLimitsSetWithOpts(pod *v1.Pod, opts PodResourcesOptions) bool {
+	if opts.SkipPodLevelResources || pod.Spec.Resources == nil {
 		return false
 	}
 
@@ -136,7 +186,7 @@ func IsPodLevelLimitsSet(pod *v1.Pod) bool {
 	}
 
 	for resourceName := range pod.Spec.Resources.Limits {
-		if IsSupportedPodLevelResource(resourceName) {
+		if IsSupportedPodLevelResourceWithOpts(resourceName, opts) {
 			return true
 		}
 	}
@@ -155,13 +205,13 @@ func PodRequests(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 		reqs = AggregateContainerRequests(pod, opts)
 	}
 
-	if !opts.SkipPodLevelResources && IsPodLevelRequestsSet(pod) {
+	if !opts.SkipPodLevelResources && IsPodLevelRequestsSetWithOpts(pod, opts) {
 		effectiveReqs := pod.Spec.Resources.Requests
 		if opts.InPlacePodLevelResourcesVerticalScalingEnabled && opts.UseStatusResources && pod.Status.Resources != nil {
 			effectiveReqs = effectivePodLevelResources(pod, pod.Spec.Resources.Requests, pod.Status.Resources.Requests, pod.Status.AllocatedResources)
 		}
 
-		applyPodLevelResources(reqs, effectiveReqs)
+		applyPodLevelResources(reqs, effectiveReqs, opts)
 	}
 
 	// Add overhead for running a pod to the sum of requests if requested:
@@ -172,9 +222,9 @@ func PodRequests(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 	return reqs
 }
 
-func applyPodLevelResources(result, effectiveResources v1.ResourceList) {
+func applyPodLevelResources(result, effectiveResources v1.ResourceList, opts PodResourcesOptions) {
 	for resourceName, quantity := range effectiveResources {
-		if IsSupportedPodLevelResource(resourceName) {
+		if IsSupportedPodLevelResourceWithOpts(resourceName, opts) {
 			result[resourceName] = quantity
 		}
 	}
@@ -388,12 +438,12 @@ func containerActuatedLimits(c *v1.Container, cs *v1.ContainerStatus, isResizeIn
 func PodLimits(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 	// attempt to reuse the maps if passed, or allocate otherwise
 	limits := AggregateContainerLimits(pod, opts)
-	if !opts.SkipPodLevelResources && IsPodLevelResourcesSet(pod) {
+	if !opts.SkipPodLevelResources && IsPodLevelResourcesSetWithOpts(pod, opts) {
 		effectiveLims := pod.Spec.Resources.Limits
 		if opts.InPlacePodLevelResourcesVerticalScalingEnabled && opts.UseStatusResources && pod.Status.Resources != nil {
 			effectiveLims = effectivePodLevelResources(pod, pod.Spec.Resources.Limits, pod.Status.Resources.Limits)
 		}
-		applyPodLevelResources(limits, effectiveLims)
+		applyPodLevelResources(limits, effectiveLims, opts)
 	}
 
 	// Add overhead to non-zero limits if requested:

@@ -534,6 +534,13 @@ func defaultPodRequests(obj *v1.Pod) {
 		return
 	}
 
+	hasComputeOrHugePageLim := resourcehelper.IsPodLevelLimitsSet(obj)
+	podEphLim, hasEphLim := obj.Spec.Resources.Limits[v1.ResourceEphemeralStorage]
+	ephEnabled := hasEphLim && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesEphemeralStorage)
+	if !hasComputeOrHugePageLim && !ephEnabled {
+		return
+	}
+
 	var podReqs v1.ResourceList
 	podReqs = obj.Spec.Resources.Requests
 	if podReqs == nil {
@@ -542,24 +549,36 @@ func defaultPodRequests(obj *v1.Pod) {
 
 	aggrCtrReqs := resourcehelper.AggregateContainerRequests(obj, resourcehelper.PodResourcesOptions{})
 
-	// When containers specify requests for a resource (supported by
-	// PodLevelResources feature) and pod-level requests are not set, the pod-level requests
-	// default to the effective requests of all the containers for that resource.
-	for key, aggrCtrLim := range aggrCtrReqs {
-		// Default pod level requests for overcommittable resources from aggregated container requests.
-		if _, exists := podReqs[key]; !exists && resourcehelper.IsSupportedPodLevelResource(key) && corev1helper.IsOvercommitAllowed(key) {
-			podReqs[key] = aggrCtrLim.DeepCopy()
+	if hasComputeOrHugePageLim {
+		// When containers specify requests for a resource (supported by
+		// PodLevelResources feature) and pod-level requests are not set, the pod-level requests
+		// default to the effective requests of all the containers for that resource.
+		for key, aggrCtrLim := range aggrCtrReqs {
+			// Default pod level requests for overcommittable resources from aggregated container requests.
+			if _, exists := podReqs[key]; !exists && resourcehelper.IsSupportedPodLevelResource(key) && corev1helper.IsOvercommitAllowed(key) {
+				podReqs[key] = aggrCtrLim
+			}
+		}
+
+		// When no containers specify requests for a resource, the pod-level requests
+		// will default to match the pod-level limits, if pod-level
+		// limits exist for that resource.
+		// Defaulting for pod level hugepages requests is dependent on defaultHugePagePodLimits,
+		// if defaultHugePagePodLimits defined the limit, the request will be set here.
+		for key, podLim := range obj.Spec.Resources.Limits {
+			if _, exists := podReqs[key]; !exists && resourcehelper.IsSupportedPodLevelResource(key) {
+				podReqs[key] = podLim
+			}
 		}
 	}
 
-	// When no containers specify requests for a resource, the pod-level requests
-	// will default to match the pod-level limits, if pod-level
-	// limits exist for that resource.
-	// Defaulting for pod level hugepages requests is dependent on defaultHugePagePodLimits,
-	// if defaultHugePagePodLimits defined the limit, the request will be set here.
-	for key, podLim := range obj.Spec.Resources.Limits {
-		if _, exists := podReqs[key]; !exists && resourcehelper.IsSupportedPodLevelResource(key) {
-			podReqs[key] = podLim.DeepCopy()
+	if ephEnabled {
+		if _, exists := podReqs[v1.ResourceEphemeralStorage]; !exists {
+			if aggrEphReq, ok := aggrCtrReqs[v1.ResourceEphemeralStorage]; ok {
+				podReqs[v1.ResourceEphemeralStorage] = aggrEphReq
+			} else {
+				podReqs[v1.ResourceEphemeralStorage] = podEphLim
+			}
 		}
 	}
 

@@ -4799,3 +4799,212 @@ func TestResizeConditionsAndSupportedResources(t *testing.T) {
 		t.Errorf("expected SupportedPodLevelResources to contain CPU")
 	}
 }
+
+func TestPodLevelEphemeralStorage(t *testing.T) {
+	restartAlways := v1.ContainerRestartPolicyAlways
+	enabledOpts := PodResourcesOptions{PodLevelResourcesEphemeralStorageEnabled: true}
+	disabledOpts := PodResourcesOptions{PodLevelResourcesEphemeralStorageEnabled: false}
+
+	if SupportedPodLevelResources().Has(v1.ResourceEphemeralStorage) {
+		t.Errorf("expected optionless SupportedPodLevelResources not to contain ephemeral-storage")
+	}
+	if !SupportedPodLevelResourcesWithOpts(enabledOpts).Has(v1.ResourceEphemeralStorage) {
+		t.Errorf("expected SupportedPodLevelResourcesWithOpts(enabled) to contain ephemeral-storage")
+	}
+	if SupportedPodLevelResourcesWithOpts(disabledOpts).Has(v1.ResourceEphemeralStorage) {
+		t.Errorf("expected SupportedPodLevelResourcesWithOpts(disabled) not to contain ephemeral-storage")
+	}
+	if IsSupportedPodLevelResource(v1.ResourceEphemeralStorage) {
+		t.Errorf("expected optionless IsSupportedPodLevelResource(ephemeral-storage) to be false")
+	}
+	if !IsSupportedPodLevelResourceWithOpts(v1.ResourceEphemeralStorage, enabledOpts) {
+		t.Errorf("expected IsSupportedPodLevelResourceWithOpts(ephemeral-storage, enabled) to be true")
+	}
+	if IsSupportedPodLevelResourceWithOpts(v1.ResourceEphemeralStorage, disabledOpts) {
+		t.Errorf("expected IsSupportedPodLevelResourceWithOpts(ephemeral-storage, disabled) to be false")
+	}
+
+	esOnlyPod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Resources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("5Gi")},
+				Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("20Gi")},
+			},
+		},
+	}
+	if IsPodLevelResourcesSet(esOnlyPod) {
+		t.Errorf("expected optionless IsPodLevelResourcesSet to be false for ephemeral-storage-only pod")
+	}
+	if !IsPodLevelResourcesSetWithOpts(esOnlyPod, enabledOpts) {
+		t.Errorf("expected IsPodLevelResourcesSetWithOpts(enabled) to be true")
+	}
+	if IsPodLevelResourcesSetWithOpts(esOnlyPod, disabledOpts) {
+		t.Errorf("expected IsPodLevelResourcesSetWithOpts(disabled) to be false")
+	}
+	if !IsPodLevelRequestsSetWithOpts(esOnlyPod, enabledOpts) {
+		t.Errorf("expected IsPodLevelRequestsSetWithOpts(enabled) to be true")
+	}
+	if IsPodLevelRequestsSetWithOpts(esOnlyPod, disabledOpts) {
+		t.Errorf("expected IsPodLevelRequestsSetWithOpts(disabled) to be false")
+	}
+	if !IsPodLevelLimitsSetWithOpts(esOnlyPod, enabledOpts) {
+		t.Errorf("expected IsPodLevelLimitsSetWithOpts(enabled) to be true")
+	}
+	if IsPodLevelLimitsSetWithOpts(esOnlyPod, disabledOpts) {
+		t.Errorf("expected IsPodLevelLimitsSetWithOpts(disabled) to be false")
+	}
+	if IsPodLevelResourcesSetWithOpts(esOnlyPod, PodResourcesOptions{SkipPodLevelResources: true, PodLevelResourcesEphemeralStorageEnabled: true}) {
+		t.Errorf("expected IsPodLevelResourcesSetWithOpts(SkipPodLevelResources: true) to be false")
+	}
+
+	cases := []struct {
+		name             string
+		pod              *v1.Pod
+		opts             PodResourcesOptions
+		expectedRequests v1.ResourceList
+		expectedLimits   v1.ResourceList
+	}{
+		{
+			name: "pod-level ephemeral-storage overrides sidecar and regular container requests and limits when enabled",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+						Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("20Gi")},
+					},
+					InitContainers: []v1.Container{
+						{
+							Name: "init",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("4Gi")},
+								Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("8Gi")},
+							},
+						},
+						{
+							Name:          "sidecar",
+							RestartPolicy: &restartAlways,
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("1Gi")},
+								Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("2Gi")},
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "app",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("500m")},
+							},
+						},
+					},
+				},
+			},
+			opts: enabledOpts,
+			expectedRequests: v1.ResourceList{
+				v1.ResourceCPU:              resource.MustParse("500m"),
+				v1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+			},
+			expectedLimits: v1.ResourceList{
+				v1.ResourceEphemeralStorage: resource.MustParse("20Gi"),
+			},
+		},
+		{
+			name: "rollback: pod-level ephemeral-storage ignored when gate disabled, falls back to container aggregation",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:              resource.MustParse("2"),
+							v1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:              resource.MustParse("4"),
+							v1.ResourceEphemeralStorage: resource.MustParse("20Gi"),
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "app",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+								Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("6Gi")},
+							},
+						},
+					},
+				},
+			},
+			opts: disabledOpts,
+			expectedRequests: v1.ResourceList{
+				v1.ResourceCPU:              resource.MustParse("2"),
+				v1.ResourceEphemeralStorage: resource.MustParse("3Gi"),
+			},
+			expectedLimits: v1.ResourceList{
+				v1.ResourceCPU:              resource.MustParse("4"),
+				v1.ResourceEphemeralStorage: resource.MustParse("6Gi"),
+			},
+		},
+		{
+			name: "pod-level ephemeral-storage request without pod-level limit preserves partial container ephemeral-storage limits",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "sidecar-with-limit",
+							Resources: v1.ResourceRequirements{
+								Limits: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("2Gi")},
+							},
+						},
+						{
+							Name: "app-without-limit",
+						},
+					},
+				},
+			},
+			opts: enabledOpts,
+			expectedRequests: v1.ResourceList{
+				v1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+			},
+			expectedLimits: v1.ResourceList{
+				v1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+			},
+		},
+		{
+			name: "pod-level ephemeral-storage with pod overhead",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Overhead: v1.ResourceList{
+						v1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+					},
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+						Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("20Gi")},
+					},
+					Containers: []v1.Container{{Name: "app"}},
+				},
+			},
+			opts: enabledOpts,
+			expectedRequests: v1.ResourceList{
+				v1.ResourceEphemeralStorage: resource.MustParse("11Gi"),
+			},
+			expectedLimits: v1.ResourceList{
+				v1.ResourceEphemeralStorage: resource.MustParse("21Gi"),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotReqs := PodRequests(tc.pod, tc.opts)
+			if !equality.Semantic.DeepEqual(gotReqs, tc.expectedRequests) {
+				t.Errorf("PodRequests() mismatch (-want +got):\n%s", diff.Diff(tc.expectedRequests, gotReqs))
+			}
+			gotLimits := PodLimits(tc.pod, tc.opts)
+			if !equality.Semantic.DeepEqual(gotLimits, tc.expectedLimits) {
+				t.Errorf("PodLimits() mismatch (-want +got):\n%s", diff.Diff(tc.expectedLimits, gotLimits))
+			}
+		})
+	}
+}

@@ -22330,12 +22330,17 @@ func TestValidatePodResources(t *testing.T) {
 }
 
 func TestValidatePodResourceConsistency(t *testing.T) {
-	path := field.NewPath("resources")
+	specPath := field.NewPath("spec")
+	path := specPath.Child("resources")
+	restartAlways := core.ContainerRestartPolicyAlways
 	tests := []struct {
-		name           string
-		podResources   core.ResourceRequirements
-		containers     []core.Container
-		expectedErrors []string
+		name                    string
+		ephemeralStorageEnabled bool
+		podResources            core.ResourceRequirements
+		containers              []core.Container
+		initContainers          []core.Container
+		expectedErrors          []string
+		expectedErrorFields     []string
 	}{{
 		name: "aggregate container requests less than pod requests",
 		podResources: core.ResourceRequirements{
@@ -22574,16 +22579,175 @@ func TestValidatePodResourceConsistency(t *testing.T) {
 			"must be less than or equal to pod limits",
 			"must be less than or equal to pod limits",
 		},
+	}, {
+		name:                    "ephemeral-storage aggregate container limits greater than pod limit is allowed when individual limits fit",
+		ephemeralStorageEnabled: true,
+		podResources: core.ResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+			},
+			Limits: core.ResourceList{
+				core.ResourceEphemeralStorage: resource.MustParse("20Gi"),
+			},
+		},
+		initContainers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("8Gi")},
+					Limits:   core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("15Gi")},
+				},
+			},
+			{
+				RestartPolicy: &restartAlways,
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("2Gi")},
+					Limits:   core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("15Gi")},
+				},
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("5Gi")},
+					Limits:   core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("15Gi")},
+				},
+			},
+		},
+	}, {
+		name:                    "ephemeral-storage aggregate container requests exceed pod request",
+		ephemeralStorageEnabled: true,
+		podResources: core.ResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceEphemeralStorage: resource.MustParse("5Gi"),
+			},
+		},
+		initContainers: []core.Container{
+			{
+				RestartPolicy: &restartAlways,
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+				},
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+				},
+			},
+		},
+		expectedErrors: []string{
+			"must be greater than or equal to aggregate container requests",
+		},
+	}, {
+		name:                    "ephemeral-storage individual regular container limit exceeds pod limit",
+		ephemeralStorageEnabled: true,
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("15Gi")},
+				},
+			},
+		},
+		expectedErrors: []string{
+			"must be less than or equal to pod limits",
+		},
+		expectedErrorFields: []string{
+			"spec.resources.containers[0][ephemeral-storage].limits",
+		},
+	}, {
+		name:                    "ephemeral-storage individual initContainer and sidecar limit exceeds pod limit",
+		ephemeralStorageEnabled: true,
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+			},
+		},
+		initContainers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("12Gi")},
+				},
+			},
+			{
+				RestartPolicy: &restartAlways,
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("15Gi")},
+				},
+			},
+		},
+		containers: []core.Container{{}},
+		expectedErrors: []string{
+			"must be less than or equal to pod limits",
+			"must be less than or equal to pod limits",
+		},
+		expectedErrorFields: []string{
+			"spec.initContainers[0].resources.limits[ephemeral-storage]",
+			"spec.initContainers[1].resources.limits[ephemeral-storage]",
+		},
+	}, {
+		name:                    "initContainer cpu limit greater than pod cpu limit remains valid",
+		ephemeralStorageEnabled: true,
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("2"),
+				core.ResourceMemory: resource.MustParse("2Gi"),
+			},
+		},
+		initContainers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("4"),
+						core.ResourceMemory: resource.MustParse("2Gi"),
+					},
+				},
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("1"),
+						core.ResourceMemory: resource.MustParse("1Gi"),
+					},
+				},
+			},
+		},
+	}, {
+		name:                    "pod-level zero ephemeral-storage limit is valid",
+		ephemeralStorageEnabled: true,
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceEphemeralStorage: resource.MustParse("0"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{core.ResourceEphemeralStorage: resource.MustParse("0")},
+				},
+			},
+		},
 	},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := core.PodSpec{
-				Resources:  &tc.podResources,
-				Containers: tc.containers,
+				Resources:      &tc.podResources,
+				Containers:     tc.containers,
+				InitContainers: tc.initContainers,
 			}
-			errs := validatePodResourceConsistency(&spec, path)
+			errs := validatePodResourceConsistency(&spec, specPath, path, PodValidationOptions{
+				PodLevelResourcesEnabled:                 true,
+				PodLevelResourcesEphemeralStorageEnabled: tc.ephemeralStorageEnabled,
+			})
 			if len(errs) != len(tc.expectedErrors) {
 				t.Errorf("expected %d errors, got %d errors, got errors: %v", len(tc.expectedErrors), len(errs), errs)
 			}
@@ -22601,6 +22765,19 @@ func TestValidatePodResourceConsistency(t *testing.T) {
 					t.Errorf("expected: %v, got errors: %v", expectedErr, errs)
 				}
 			}
+
+			for _, expectedField := range tc.expectedErrorFields {
+				foundField := false
+				for _, gotErr := range errs {
+					if gotErr.Field == expectedField {
+						foundField = true
+						break
+					}
+				}
+				if !foundField {
+					t.Errorf("expected error on field %q, got errors: %v", expectedField, errs)
+				}
+			}
 		})
 	}
 }
@@ -22608,38 +22785,43 @@ func TestValidatePodResourceConsistency(t *testing.T) {
 func TestValidatePodResourceNames(t *testing.T) {
 	table := []struct {
 		input           core.ResourceName
+		opts            PodValidationOptions
 		expectedFailure bool
 	}{
-		{"memory", false},
-		{"cpu", false},
-		{"storage", true},
-		{v1.ResourceHugePagesPrefix + "2Mi", false},
-		{v1.ResourceHugePagesPrefix + "1Gi", false},
-		{"requests.cpu", true},
-		{"requests.memory", true},
-		{"requests.storage", true},
-		{"limits.cpu", true},
-		{"limits.memory", true},
-		{"limits.storage", true},
-		{"network", true},
-		{"disk", true},
-		{"", true},
-		{".", true},
-		{"..", true},
-		{"my.favorite.app.co/12345", true},
-		{"my.favorite.app.co/_12345", true},
-		{"my.favorite.app.co/12345_", true},
-		{"kubernetes.io/..", true},
-		{core.ResourceName("kubernetes.io/" + strings.Repeat("a", 64)), true},
-		{core.ResourceName("kubernetes.io/" + strings.Repeat("a", 64)), true},
-		{core.ResourceName("kubernetes.io/" + core.ResourceCPU), true},
-		{core.ResourceName("kubernetes.io/" + core.ResourceMemory), true},
-		{"kubernetes.io//", true},
-		{"kubernetes.io", true},
-		{"kubernetes.io/will/not/work/", true},
+		{input: "memory", expectedFailure: false},
+		{input: "cpu", expectedFailure: false},
+		{input: "ephemeral-storage", opts: PodValidationOptions{PodLevelResourcesEphemeralStorageEnabled: false}, expectedFailure: true},
+		{input: "ephemeral-storage", opts: PodValidationOptions{PodLevelResourcesEphemeralStorageEnabled: true}, expectedFailure: false},
+		{input: "requests.ephemeral-storage", opts: PodValidationOptions{PodLevelResourcesEphemeralStorageEnabled: true}, expectedFailure: true},
+		{input: "limits.ephemeral-storage", opts: PodValidationOptions{PodLevelResourcesEphemeralStorageEnabled: true}, expectedFailure: true},
+		{input: "storage", expectedFailure: true},
+		{input: v1.ResourceHugePagesPrefix + "2Mi", expectedFailure: false},
+		{input: v1.ResourceHugePagesPrefix + "1Gi", expectedFailure: false},
+		{input: "requests.cpu", expectedFailure: true},
+		{input: "requests.memory", expectedFailure: true},
+		{input: "requests.storage", expectedFailure: true},
+		{input: "limits.cpu", expectedFailure: true},
+		{input: "limits.memory", expectedFailure: true},
+		{input: "limits.storage", expectedFailure: true},
+		{input: "network", expectedFailure: true},
+		{input: "disk", expectedFailure: true},
+		{input: "", expectedFailure: true},
+		{input: ".", expectedFailure: true},
+		{input: "..", expectedFailure: true},
+		{input: "my.favorite.app.co/12345", expectedFailure: true},
+		{input: "my.favorite.app.co/_12345", expectedFailure: true},
+		{input: "my.favorite.app.co/12345_", expectedFailure: true},
+		{input: "kubernetes.io/..", expectedFailure: true},
+		{input: core.ResourceName("kubernetes.io/" + strings.Repeat("a", 64)), expectedFailure: true},
+		{input: core.ResourceName("kubernetes.io/" + strings.Repeat("a", 64)), expectedFailure: true},
+		{input: core.ResourceName("kubernetes.io/" + core.ResourceCPU), expectedFailure: true},
+		{input: core.ResourceName("kubernetes.io/" + core.ResourceMemory), expectedFailure: true},
+		{input: "kubernetes.io//", expectedFailure: true},
+		{input: "kubernetes.io", expectedFailure: true},
+		{input: "kubernetes.io/will/not/work/", expectedFailure: true},
 	}
 	for _, item := range table {
-		errs := validatePodResourceName(item.input, field.NewPath("field"))
+		errs := validatePodResourceName(item.input, field.NewPath("field"), item.opts)
 		if len(errs) != 0 && !item.expectedFailure {
 			t.Errorf("expected no failure for input %q, got: %v", item.input, errs)
 		}
@@ -30074,6 +30256,7 @@ func TestValidatePodResize(t *testing.T) {
 		disableInitCtrResize              bool
 		enableMemoryBackedVolumesResize   bool
 		enableDRANodeAllocatableResources bool
+		enablePodLevelEphemeralStorage    bool
 		err                               string
 	}{
 		{
@@ -30292,6 +30475,121 @@ func TestValidatePodResize(t *testing.T) {
 				podtest.SetPodResources(&core.ResourceRequirements{
 					Requests: getResources("200m", "100Mi", "", "100Mi"),
 					Limits:   getResources("100m", "200Mi", "", ""),
+				}),
+			),
+			err: "spec: Forbidden: only cpu and memory resources are mutable",
+		},
+		{
+			test:                           "pod-level resources with pod-level ephemeral-storage request mutation rejected",
+			enablePodLevelEphemeralStorage: true,
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "5Gi", ""),
+					Limits:   getResources("200m", "200Mi", "10Gi", ""),
+				}),
+			),
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "6Gi", ""),
+					Limits:   getResources("200m", "200Mi", "10Gi", ""),
+				}),
+			),
+			err: "spec: Forbidden: only cpu and memory resources are mutable at pod-level",
+		},
+		{
+			test:                           "pod-level resources with pod-level ephemeral-storage limit mutation rejected",
+			enablePodLevelEphemeralStorage: true,
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "5Gi", ""),
+					Limits:   getResources("200m", "200Mi", "10Gi", ""),
+				}),
+			),
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "5Gi", ""),
+					Limits:   getResources("200m", "200Mi", "20Gi", ""),
+				}),
+			),
+			err: "spec: Forbidden: only cpu and memory resources are mutable at pod-level",
+		},
+		{
+			test:                           "pod-level resources with pod-level ephemeral-storage removal rejected",
+			enablePodLevelEphemeralStorage: true,
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "5Gi", ""),
+					Limits:   getResources("200m", "200Mi", "10Gi", ""),
+				}),
+			),
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "", ""),
+					Limits:   getResources("200m", "200Mi", "10Gi", ""),
+				}),
+			),
+			err: "spec.resources.requests: Forbidden: pod-level resource requests cannot be removed",
+		},
+		{
+			test:                           "pod-level resources cpu/memory resize allowed when pod-level ephemeral-storage unchanged",
+			enablePodLevelEphemeralStorage: true,
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "5Gi", ""),
+					Limits:   getResources("200m", "200Mi", "10Gi", ""),
+				}),
+			),
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("200m", "200Mi", "5Gi", ""),
+					Limits:   getResources("400m", "400Mi", "10Gi", ""),
+				}),
+			),
+			err: "",
+		},
+		{
+			test:                           "pod-level resources adding ephemeral-storage on resize rejected when feature disabled",
+			enablePodLevelEphemeralStorage: false,
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "", ""),
+					Limits:   getResources("200m", "200Mi", "", ""),
+				}),
+			),
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{Requests: getResources("100m", "100Mi", "", "")}),
+				)),
+				podtest.SetPodResources(&core.ResourceRequirements{
+					Requests: getResources("100m", "100Mi", "5Gi", ""),
+					Limits:   getResources("200m", "200Mi", "10Gi", ""),
 				}),
 			),
 			err: "spec: Forbidden: only cpu and memory resources are mutable",
@@ -31393,6 +31691,7 @@ func TestValidatePodResize(t *testing.T) {
 				AllowSidecarResizePolicy:                            true,
 				InPlacePodLevelResourcesVerticalScalingEnabled:      true,
 				PodLevelResourcesEnabled:                            true,
+				PodLevelResourcesEphemeralStorageEnabled:            test.enablePodLevelEphemeralStorage,
 				InPlacePodVerticalScalingMemoryBackedVolumesEnabled: test.enableMemoryBackedVolumesResize,
 			})
 

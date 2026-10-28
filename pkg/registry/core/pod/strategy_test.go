@@ -843,35 +843,228 @@ func TestApplyPodLevelResourceDefaults(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, tc.plrEnabled)
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResourcesFixDefaulting, tc.plrFixUpdateEnabled)
 
-			podutil.DefaultPodLevelResources(tc.pod)
+			pod := tc.pod.DeepCopy()
+			podutil.DefaultPodLevelResources(pod)
 
 			if len(tc.wantRequests) == 0 {
-				if tc.pod.Spec.Resources != nil && len(tc.pod.Spec.Resources.Requests) > 0 {
-					t.Errorf("expected no requests, got %v", tc.pod.Spec.Resources.Requests)
+				if pod.Spec.Resources != nil && len(pod.Spec.Resources.Requests) > 0 {
+					t.Errorf("expected no requests, got %v", pod.Spec.Resources.Requests)
 				}
 			} else {
-				if tc.pod.Spec.Resources == nil || tc.pod.Spec.Resources.Requests == nil {
+				if pod.Spec.Resources == nil || pod.Spec.Resources.Requests == nil {
 					t.Fatalf("expected non-nil requests")
 				}
-				if diff := cmp.Diff(tc.wantRequests, tc.pod.Spec.Resources.Requests); diff != "" {
+				if diff := cmp.Diff(tc.wantRequests, pod.Spec.Resources.Requests); diff != "" {
 					t.Errorf("unexpected requests (-want, +got):\n%s", diff)
 				}
 			}
 
 			if len(tc.wantLimits) == 0 {
-				if tc.pod.Spec.Resources != nil && len(tc.pod.Spec.Resources.Limits) > 0 {
-					t.Errorf("expected no limits, got %v", tc.pod.Spec.Resources.Limits)
+				if pod.Spec.Resources != nil && len(pod.Spec.Resources.Limits) > 0 {
+					t.Errorf("expected no limits, got %v", pod.Spec.Resources.Limits)
 				}
 			} else {
-				if tc.pod.Spec.Resources == nil || tc.pod.Spec.Resources.Limits == nil {
+				if pod.Spec.Resources == nil || pod.Spec.Resources.Limits == nil {
 					t.Fatalf("expected non-nil limits")
 				}
-				if diff := cmp.Diff(tc.wantLimits, tc.pod.Spec.Resources.Limits); diff != "" {
+				if diff := cmp.Diff(tc.wantLimits, pod.Spec.Resources.Limits); diff != "" {
 					t.Errorf("unexpected limits (-want, +got):\n%s", diff)
 				}
 			}
 		})
 	}
+
+	t.Run("ephemeral-storage pod-level defaulting", func(t *testing.T) {
+		ephTests := []struct {
+			name        string
+			ephGate     bool
+			pod         *api.Pod
+			wantRequest string
+			wantLimit   string
+		}{
+			{
+				name:    "gate disabled: pod-level ephemeral-storage limit does not default pod-level request",
+				ephGate: false,
+				pod: &api.Pod{
+					Spec: api.PodSpec{
+						Containers: []api.Container{
+							newContainer("c1", api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")}, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("1Gi")}),
+							newContainer("c2", api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")}, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("2Gi")}),
+						},
+						Resources: &api.ResourceRequirements{
+							Limits: api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("4Gi")},
+						},
+					},
+				},
+				wantLimit: "4Gi",
+			},
+			{
+				name:    "gate enabled: pod-level ephemeral-storage limit defaults request from containers, ignoring emptyDir.sizeLimit",
+				ephGate: true,
+				pod: &api.Pod{
+					Spec: api.PodSpec{
+						Volumes: []api.Volume{{
+							Name: "scratch",
+							VolumeSource: api.VolumeSource{
+								EmptyDir: &api.EmptyDirVolumeSource{
+									SizeLimit: new(resource.MustParse("10Gi")),
+								},
+							},
+						}},
+						InitContainers: []api.Container{
+							newContainer("init", nil, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("4Gi")}),
+						},
+						Containers: []api.Container{
+							newContainer("c1", api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")}, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("1Gi")}),
+							newContainer("c2", api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")}, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("2Gi")}),
+						},
+						Resources: &api.ResourceRequirements{
+							Limits: api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("4Gi")},
+						},
+					},
+				},
+				wantRequest: "1000Mi",
+				wantLimit:   "4Gi",
+			},
+			{
+				name:    "gate enabled: pod-level ephemeral-storage request with all container limits defaults pod limit to max container limit",
+				ephGate: true,
+				pod: &api.Pod{
+					Spec: api.PodSpec{
+						InitContainers: []api.Container{
+							newContainer("init", nil, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("4Gi")}),
+						},
+						Containers: []api.Container{
+							newContainer("c1", api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")}, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("1Gi")}),
+							newContainer("c2", api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")}, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("2Gi")}),
+						},
+						Resources: &api.ResourceRequirements{
+							Requests: api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("1000Mi")},
+						},
+					},
+				},
+				wantRequest: "1000Mi",
+				wantLimit:   "4Gi",
+			},
+			{
+				name:    "gate enabled: pod-level cpu only does not cross-default container ephemeral-storage to pod level",
+				ephGate: true,
+				pod: &api.Pod{
+					Spec: api.PodSpec{
+						Containers: []api.Container{
+							newContainer("c1", api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")}, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("1Gi")}),
+							newContainer("c2", api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")}, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("2Gi")}),
+						},
+						Resources: &api.ResourceRequirements{
+							Requests: api.ResourceList{api.ResourceCPU: resource.MustParse("200m")},
+						},
+					},
+				},
+			},
+			{
+				name:    "gate enabled: partial container ephemeral-storage limits do not default pod limit",
+				ephGate: true,
+				pod: &api.Pod{
+					Spec: api.PodSpec{
+						Containers: []api.Container{
+							newContainer("c1", nil, api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("1Gi")}),
+							newContainer("c2", nil, nil),
+						},
+						Resources: &api.ResourceRequirements{
+							Requests: api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("500Mi")},
+						},
+					},
+				},
+				wantRequest: "500Mi",
+			},
+		}
+
+		for _, tc := range ephTests {
+			t.Run(tc.name, func(t *testing.T) {
+				if tc.ephGate {
+					featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+						features.NodeDeclaredFeatures:              true,
+						features.PodLevelResources:                 true,
+						features.PodLevelResourcesFixDefaulting:    true,
+						features.PodLevelResourcesEphemeralStorage: true,
+					})
+				} else {
+					featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+						features.PodLevelResources:                 true,
+						features.PodLevelResourcesFixDefaulting:    true,
+						features.PodLevelResourcesEphemeralStorage: false,
+					})
+				}
+
+				pod := tc.pod.DeepCopy()
+				podutil.DefaultPodLevelResources(pod)
+
+				var gotReq resource.Quantity
+				var hasReq bool
+				if pod.Spec.Resources != nil && pod.Spec.Resources.Requests != nil {
+					gotReq, hasReq = pod.Spec.Resources.Requests[api.ResourceEphemeralStorage]
+				}
+				if tc.wantRequest == "" {
+					if hasReq {
+						t.Errorf("expected no pod-level ephemeral-storage request, got %s", gotReq.String())
+					}
+				} else if !hasReq || !gotReq.Equal(resource.MustParse(tc.wantRequest)) {
+					t.Errorf("expected pod-level ephemeral-storage request %s, got %v (present=%v)", tc.wantRequest, gotReq, hasReq)
+				}
+
+				var gotLim resource.Quantity
+				var hasLim bool
+				if pod.Spec.Resources != nil && pod.Spec.Resources.Limits != nil {
+					gotLim, hasLim = pod.Spec.Resources.Limits[api.ResourceEphemeralStorage]
+				}
+				if tc.wantLimit == "" {
+					if hasLim {
+						t.Errorf("expected no pod-level ephemeral-storage limit, got %s", gotLim.String())
+					}
+				} else if !hasLim || !gotLim.Equal(resource.MustParse(tc.wantLimit)) {
+					t.Errorf("expected pod-level ephemeral-storage limit %s, got %v (present=%v)", tc.wantLimit, gotLim, hasLim)
+				}
+			})
+		}
+	})
+
+	t.Run("PrepareForCreate with pod-level ephemeral-storage only does not cross-default cpu/memory or flip QoS", func(t *testing.T) {
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.NodeDeclaredFeatures:              true,
+			features.PodLevelResources:                 true,
+			features.PodLevelResourcesFixDefaulting:    true,
+			features.PodLevelResourcesEphemeralStorage: true,
+		})
+
+		pod := &api.Pod{
+			Spec: api.PodSpec{
+				InitContainers: []api.Container{
+					newContainer("init", getResourceList("500m", "100Mi"), getResourceList("1", "100Mi")),
+				},
+				Containers: []api.Container{
+					newContainer("app", getResourceList("1", "100Mi"), getResourceList("1", "100Mi")),
+				},
+				Resources: &api.ResourceRequirements{
+					Limits: api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("1Gi")},
+				},
+			},
+		}
+
+		Strategy.PrepareForCreate(genericapirequest.NewContext(), pod)
+		if pod.Status.QOSClass != api.PodQOSBurstable {
+			t.Fatalf("expected QOSClass %q, got %q", api.PodQOSBurstable, pod.Status.QOSClass)
+		}
+		if _, hasCPU := pod.Spec.Resources.Requests[api.ResourceCPU]; hasCPU {
+			t.Errorf("expected no pod-level CPU request to be cross-defaulted, got %v", pod.Spec.Resources.Requests)
+		}
+		if _, hasMem := pod.Spec.Resources.Limits[api.ResourceMemory]; hasMem {
+			t.Errorf("expected no pod-level memory limit to be cross-defaulted, got %v", pod.Spec.Resources.Limits)
+		}
+		wantEph := resource.MustParse("1Gi")
+		if got := pod.Spec.Resources.Requests[api.ResourceEphemeralStorage]; !got.Equal(wantEph) {
+			t.Errorf("expected pod-level ephemeral-storage request %v, got %v", wantEph, got)
+		}
+	})
 }
 
 // TestPrepareForUpdatePodLevelResources tests update and resize strategy PrepareForUpdate behaviors.
@@ -1077,6 +1270,134 @@ func TestPrepareForUpdatePodLevelResources(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("resize does not newly default ephemeral-storage onto legacy pod when PodLevelResourcesEphemeralStorage enabled", func(t *testing.T) {
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.NodeDeclaredFeatures:                    true,
+			features.PodLevelResources:                       true,
+			features.PodLevelResourcesFixDefaulting:          true,
+			features.PodLevelResourcesEphemeralStorage:       true,
+			features.InPlacePodVerticalScaling:               true,
+			features.InPlacePodLevelResourcesVerticalScaling: true,
+		})
+
+		oldPod := podtest.MakePod("legacy-plr",
+			podtest.SetObjectMeta(metav1.ObjectMeta{
+				Namespace:       "default",
+				Name:            "legacy-plr",
+				ResourceVersion: "1",
+			}),
+			podtest.SetContainers(podtest.MakeContainer("c1",
+				podtest.SetContainerResources(api.ResourceRequirements{
+					Requests: api.ResourceList{
+						api.ResourceCPU:              resource.MustParse("100m"),
+						api.ResourceMemory:           resource.MustParse("128Mi"),
+						api.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+					},
+					Limits: api.ResourceList{
+						api.ResourceCPU:              resource.MustParse("200m"),
+						api.ResourceMemory:           resource.MustParse("256Mi"),
+						api.ResourceEphemeralStorage: resource.MustParse("4Gi"),
+					},
+				}),
+			)),
+		)
+		oldPod.Spec.OS = &api.PodOS{Name: api.Linux}
+		oldPod.Spec.Resources = &api.ResourceRequirements{
+			Requests: getResourceList("100m", "128Mi"),
+			Limits:   getResourceList("200m", "256Mi"),
+		}
+
+		newPod := oldPod.DeepCopy()
+		newPod.Spec.Resources = &api.ResourceRequirements{
+			Requests: getResourceList("200m", "128Mi"),
+			Limits:   getResourceList("300m", "256Mi"),
+		}
+
+		ctx := genericapirequest.NewContext()
+		ResizeStrategy.PrepareForUpdate(ctx, newPod, oldPod)
+		if _, exists := newPod.Spec.Resources.Requests[api.ResourceEphemeralStorage]; exists {
+			t.Fatalf("expected ResizeStrategy.PrepareForUpdate not to inject ephemeral-storage into requests, got %v", newPod.Spec.Resources.Requests)
+		}
+		if _, exists := newPod.Spec.Resources.Limits[api.ResourceEphemeralStorage]; exists {
+			t.Fatalf("expected ResizeStrategy.PrepareForUpdate not to inject ephemeral-storage into limits, got %v", newPod.Spec.Resources.Limits)
+		}
+		if errs := ResizeStrategy.ValidateUpdate(ctx, newPod, oldPod); len(errs) != 0 {
+			t.Fatalf("expected CPU resize on legacy pod to pass validation, got: %v", errs)
+		}
+	})
+
+	t.Run("resize preserves hugepages re-defaulting and pod-level ephemeral-storage request re-defaulting", func(t *testing.T) {
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.NodeDeclaredFeatures:                    true,
+			features.PodLevelResources:                       true,
+			features.PodLevelResourcesFixDefaulting:          true,
+			features.PodLevelResourcesEphemeralStorage:       true,
+			features.InPlacePodVerticalScaling:               true,
+			features.InPlacePodLevelResourcesVerticalScaling: true,
+		})
+
+		hugepage2Mi := api.ResourceName(api.ResourceHugePagesPrefix + "2Mi")
+		oldPod := podtest.MakePod("plr-huge-eph",
+			podtest.SetObjectMeta(metav1.ObjectMeta{
+				Namespace:       "default",
+				Name:            "plr-huge-eph",
+				ResourceVersion: "1",
+			}),
+			podtest.SetContainers(podtest.MakeContainer("c1",
+				podtest.SetContainerResources(api.ResourceRequirements{
+					Requests: api.ResourceList{
+						api.ResourceCPU:    resource.MustParse("100m"),
+						api.ResourceMemory: resource.MustParse("128Mi"),
+						hugepage2Mi:        resource.MustParse("2Mi"),
+					},
+					Limits: api.ResourceList{
+						api.ResourceCPU:    resource.MustParse("200m"),
+						api.ResourceMemory: resource.MustParse("256Mi"),
+						hugepage2Mi:        resource.MustParse("2Mi"),
+					},
+				}),
+			)),
+		)
+		oldPod.Spec.OS = &api.PodOS{Name: api.Linux}
+		oldPod.Spec.Resources = &api.ResourceRequirements{
+			Requests: api.ResourceList{
+				api.ResourceCPU:              resource.MustParse("100m"),
+				api.ResourceMemory:           resource.MustParse("128Mi"),
+				hugepage2Mi:                  resource.MustParse("2Mi"),
+				api.ResourceEphemeralStorage: resource.MustParse("4Gi"),
+			},
+			Limits: api.ResourceList{
+				api.ResourceCPU:              resource.MustParse("200m"),
+				api.ResourceMemory:           resource.MustParse("256Mi"),
+				hugepage2Mi:                  resource.MustParse("2Mi"),
+				api.ResourceEphemeralStorage: resource.MustParse("4Gi"),
+			},
+		}
+
+		// Simulate PUT /resize where caller sends updated CPU/memory limits and pod-level ephemeral-storage limit,
+		// omitting defaulted hugepages and ephemeral-storage request.
+		newPod := oldPod.DeepCopy()
+		newPod.Spec.Resources = &api.ResourceRequirements{
+			Limits: api.ResourceList{
+				api.ResourceCPU:              resource.MustParse("300m"),
+				api.ResourceMemory:           resource.MustParse("256Mi"),
+				api.ResourceEphemeralStorage: resource.MustParse("4Gi"),
+			},
+		}
+
+		ctx := genericapirequest.NewContext()
+		ResizeStrategy.PrepareForUpdate(ctx, newPod, oldPod)
+		if got := newPod.Spec.Resources.Limits[hugepage2Mi]; !got.Equal(resource.MustParse("2Mi")) {
+			t.Fatalf("expected ResizeStrategy.PrepareForUpdate to re-default hugepages-2Mi limit to 2Mi, got %v", got)
+		}
+		if got := newPod.Spec.Resources.Requests[api.ResourceEphemeralStorage]; !got.Equal(resource.MustParse("4Gi")) {
+			t.Fatalf("expected ResizeStrategy.PrepareForUpdate to re-default ephemeral-storage request to 4Gi, got %v", got)
+		}
+		if errs := ResizeStrategy.ValidateUpdate(ctx, newPod, oldPod); len(errs) != 0 {
+			t.Fatalf("expected PUT /resize to pass validation, got: %v", errs)
+		}
+	})
 }
 
 func TestSchedulingGatedCondition(t *testing.T) {

@@ -4153,6 +4153,99 @@ func TestPodLevelIndivisibleHugePagesValueSurvivesUpdate(t *testing.T) {
 	}
 }
 
+func TestGetValidationOptionsPodLevelEphemeralStorageRatcheting(t *testing.T) {
+	makeValidPod := func(withPodLevelEphemeralStorage bool) *api.Pod {
+		var res *api.ResourceRequirements
+		if withPodLevelEphemeralStorage {
+			res = &api.ResourceRequirements{
+				Requests: api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("5Gi")},
+				Limits:   api.ResourceList{api.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+			}
+		}
+		return &api.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "pod",
+				Namespace:       "default",
+				ResourceVersion: "1",
+			},
+			Spec: api.PodSpec{
+				RestartPolicy:                 api.RestartPolicyAlways,
+				DNSPolicy:                     api.DNSClusterFirst,
+				TerminationGracePeriodSeconds: ptr.To[int64](30),
+				Containers: []api.Container{{
+					Name:                     "ctr",
+					Image:                    "image:v1",
+					ImagePullPolicy:          api.PullIfNotPresent,
+					TerminationMessagePolicy: api.TerminationMessageReadFile,
+				}},
+				Resources: res,
+			},
+		}
+	}
+
+	t.Run("create rejected when PodLevelResourcesEphemeralStorage disabled", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, true)
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResourcesEphemeralStorage, false)
+		pod := makeValidPod(true)
+		opts := GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, nil, &pod.ObjectMeta, nil)
+		if opts.PodLevelResourcesEphemeralStorageEnabled {
+			t.Fatalf("expected PodLevelResourcesEphemeralStorageEnabled=false on create when gate disabled")
+		}
+		errs := apivalidation.ValidatePodSpec(&pod.Spec, &pod.ObjectMeta, field.NewPath("spec"), opts)
+		if len(errs) == 0 {
+			t.Fatalf("expected validation error on create when gate disabled, got none")
+		}
+	})
+
+	t.Run("create allowed when PodLevelResourcesEphemeralStorage enabled", func(t *testing.T) {
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.PodLevelResources:                 true,
+			features.PodLevelResourcesEphemeralStorage: true,
+		})
+		pod := makeValidPod(true)
+		opts := GetValidationOptionsFromPodSpecAndMeta(&pod.Spec, nil, &pod.ObjectMeta, nil)
+		if !opts.PodLevelResourcesEphemeralStorageEnabled {
+			t.Fatalf("expected PodLevelResourcesEphemeralStorageEnabled=true on create when gate enabled")
+		}
+		if errs := apivalidation.ValidatePodSpec(&pod.Spec, &pod.ObjectMeta, field.NewPath("spec"), opts); len(errs) != 0 {
+			t.Fatalf("unexpected validation errors: %v", errs)
+		}
+	})
+
+	t.Run("rollback ratcheting allows updating existing Pod and PodTemplate with pod-level ephemeral-storage", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, true)
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResourcesEphemeralStorage, false)
+
+		oldPod := makeValidPod(true)
+		newPod := oldPod.DeepCopy()
+		newPod.Labels = map[string]string{"updated": "true"}
+		newPod.Spec.Containers[0].Image = "image:v2"
+
+		opts := GetValidationOptionsFromPodSpecAndMeta(&newPod.Spec, &oldPod.Spec, &newPod.ObjectMeta, &oldPod.ObjectMeta)
+		if !opts.PodLevelResourcesEphemeralStorageEnabled {
+			t.Fatalf("expected ratcheted PodLevelResourcesEphemeralStorageEnabled=true on existing Pod update")
+		}
+		if errs := apivalidation.ValidatePodUpdate(newPod, oldPod, opts); len(errs) != 0 {
+			t.Fatalf("expected existing Pod update to succeed after rollback, got: %v", errs)
+		}
+
+		oldTmpl := &api.PodTemplateSpec{ObjectMeta: oldPod.ObjectMeta, Spec: oldPod.Spec}
+		newTmpl := &api.PodTemplateSpec{ObjectMeta: newPod.ObjectMeta, Spec: newPod.Spec}
+		tmplOpts := GetValidationOptionsFromPodTemplate(newTmpl, oldTmpl)
+		if !tmplOpts.PodLevelResourcesEphemeralStorageEnabled {
+			t.Fatalf("expected ratcheted PodLevelResourcesEphemeralStorageEnabled=true on existing PodTemplate update")
+		}
+
+		// Adding pod-level ephemeral-storage to a PodTemplate that did NOT previously use it must NOT ratchet.
+		legacyOldPod := makeValidPod(false)
+		legacyOldTmpl := &api.PodTemplateSpec{ObjectMeta: legacyOldPod.ObjectMeta, Spec: legacyOldPod.Spec}
+		noRatchetOpts := GetValidationOptionsFromPodTemplate(newTmpl, legacyOldTmpl)
+		if noRatchetOpts.PodLevelResourcesEphemeralStorageEnabled {
+			t.Fatalf("expected PodLevelResourcesEphemeralStorageEnabled=false when old PodTemplate did not use pod-level ephemeral-storage")
+		}
+	})
+}
+
 func TestHasAPIReferences(t *testing.T) {
 	tests := []struct {
 		name            string

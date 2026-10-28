@@ -22,11 +22,47 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/apis/core/helper"
 	"k8s.io/kubernetes/pkg/features"
 )
 
 var supportedQoSComputeResources = sets.New(core.ResourceCPU, core.ResourceMemory)
+
+func isPodLevelQoSResourcesSet(resources *core.ResourceRequirements) bool {
+	if resources == nil {
+		return false
+	}
+	for res := range supportedQoSComputeResources {
+		if _, ok := resources.Requests[res]; ok {
+			return true
+		}
+		if _, ok := resources.Limits[res]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// isOnlyEphemeralStorageSet returns true if ephemeral-storage is the only resource
+// specified in Requests or Limits.
+func isOnlyEphemeralStorageSet(resources *core.ResourceRequirements) bool {
+	if resources == nil {
+		return false
+	}
+	hasEphemeral := false
+	for name := range resources.Requests {
+		if name != core.ResourceEphemeralStorage {
+			return false
+		}
+		hasEphemeral = true
+	}
+	for name := range resources.Limits {
+		if name != core.ResourceEphemeralStorage {
+			return false
+		}
+		hasEphemeral = true
+	}
+	return hasEphemeral
+}
 
 // GetPodQOS returns the QoS class of a pod persisted in the PodStatus.QOSClass field.
 // If PodStatus.QOSClass is empty, it returns value of ComputePodQOS() which evaluates pod's QoS class.
@@ -44,9 +80,9 @@ func GetPodQOS(pod *core.Pod) core.PodQOSClass {
 // A pod is Burstable if cpu & memory limits and requests do not match across all containers.
 // NOTE: This is tested in pkg/apis/core/v1/helper/qos/qos_test.go
 func ComputePodQOS(pod *core.Pod) core.PodQOSClass {
-	// When pod-level resources are specified, we use them to determine QoS class.
+	// When pod-level QoS compute resources (CPU/memory) are specified, we use them to determine QoS class.
 	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) &&
-		(pod.Spec.Resources != nil && (!utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesFixKubeletQOSClass) || helper.IsPodLevelResourcesSet(pod))) {
+		(pod.Spec.Resources != nil && ((!utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesFixKubeletQOSClass) && !isOnlyEphemeralStorageSet(pod.Spec.Resources)) || isPodLevelQoSResourcesSet(pod.Spec.Resources))) {
 		return requirementsQOS(pod.Spec.Resources)
 	}
 

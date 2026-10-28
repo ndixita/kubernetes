@@ -399,3 +399,159 @@ func getPodWithPodLevelResources(cname string, podResources resources, resources
 
 	return pod
 }
+
+func TestGetResourceRequestPodLevelEphemeralStorage(t *testing.T) {
+	gi := int64(1024 * 1024 * 1024)
+	cases := []struct {
+		name                            string
+		pod                             *v1.Pod
+		resourceName                    v1.ResourceName
+		podLevelResourcesEnabled        bool
+		podLevelEphemeralStorageEnabled bool
+		expectedBytes                   int64
+	}{
+		{
+			name: "pod-level ephemeral-storage overrides container request when enabled",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Overhead: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("10Gi")},
+					},
+					Containers: []v1.Container{{
+						Name: "app",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("2Gi")},
+						},
+					}},
+				},
+			},
+			resourceName:                    v1.ResourceEphemeralStorage,
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: true,
+			expectedBytes:                   10 * gi,
+		},
+		{
+			name: "rollback: pod-level ephemeral-storage ignored when PodLevelResourcesEphemeralStorage disabled",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:              resource.MustParse("1"),
+							v1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+						},
+					},
+					Containers: []v1.Container{{
+						Name: "app",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("2Gi")},
+						},
+					}},
+				},
+			},
+			resourceName:                    v1.ResourceEphemeralStorage,
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: false,
+			expectedBytes:                   2 * gi,
+		},
+		{
+			name: "pod-level cpu does not zero out container-level ephemeral-storage request",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1")},
+					},
+					Containers: []v1.Container{{
+						Name: "app",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+						},
+					}},
+				},
+			},
+			resourceName:                    v1.ResourceEphemeralStorage,
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: true,
+			expectedBytes:                   3 * gi,
+		},
+		{
+			name: "pod-level cpu does not zero out container-level ephemeral-storage request when PodLevelResourcesEphemeralStorage disabled",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1")},
+					},
+					Containers: []v1.Container{{
+						Name: "app",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+						},
+					}},
+				},
+			},
+			resourceName:                    v1.ResourceEphemeralStorage,
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: false,
+			expectedBytes:                   3 * gi,
+		},
+		{
+			name: "static pod with pod-level ephemeral-storage does not zero out container-level memory request",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("5Gi")},
+					},
+					Containers: []v1.Container{{
+						Name: "app",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("1Gi")},
+						},
+					}},
+				},
+			},
+			resourceName:                    v1.ResourceMemory,
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: true,
+			expectedBytes:                   1 * gi,
+		},
+		{
+			name: "static pod with pod-level cpu skips container-level memory request when SkipContainerLevelResources is set",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1")},
+					},
+					Containers: []v1.Container{{
+						Name: "app",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("1Gi")},
+						},
+					}},
+				},
+			},
+			resourceName:                    v1.ResourceMemory,
+			podLevelResourcesEnabled:        true,
+			podLevelEphemeralStorageEnabled: true,
+			expectedBytes:                   0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.podLevelEphemeralStorageEnabled {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.NodeDeclaredFeatures:              true,
+					features.PodLevelResources:                 tc.podLevelResourcesEnabled,
+					features.PodLevelResourcesEphemeralStorage: true,
+				})
+			} else {
+				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+					features.PodLevelResources:                 tc.podLevelResourcesEnabled,
+					features.PodLevelResourcesEphemeralStorage: false,
+				})
+			}
+			got := GetResourceRequest(tc.pod, tc.resourceName)
+			assert.Equal(t, tc.expectedBytes, got)
+		})
+	}
+}

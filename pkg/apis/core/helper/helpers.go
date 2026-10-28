@@ -34,11 +34,20 @@ import (
 	"k8s.io/kubernetes/pkg/apis/core"
 )
 
-// IsPodLevelResourcesSet check if PodLevelResources pod-level resources are set.
-// It returns true if either the Requests or Limits maps are non-empty.
+// IsPodLevelResourcesSet checks if PodLevelResources pod-level resources are set.
+// It returns true if either the Requests or Limits maps contain at least one default
+// supported pod-level resource. Feature-gated resources such as ephemeral-storage
+// are excluded unless IsPodLevelResourcesSetWithOpts is called with
+// PodLevelResourcesEphemeralStorageEnabled: true.
 // Note: keep this in sync with k8s.io/component-helpers/resource.IsPodLevelResourcesSet
 func IsPodLevelResourcesSet(pod *core.Pod) bool {
-	if pod.Spec.Resources == nil {
+	return IsPodLevelResourcesSetWithOpts(pod, resourcehelper.PodResourcesOptions{})
+}
+
+// IsPodLevelResourcesSetWithOpts checks if supported pod-level resources are set according to opts.
+// Note: keep this in sync with k8s.io/component-helpers/resource.IsPodLevelResourcesSetWithOpts
+func IsPodLevelResourcesSetWithOpts(pod *core.Pod, opts resourcehelper.PodResourcesOptions) bool {
+	if opts.SkipPodLevelResources || pod.Spec.Resources == nil {
 		return false
 	}
 
@@ -47,13 +56,13 @@ func IsPodLevelResourcesSet(pod *core.Pod) bool {
 	}
 
 	for name := range pod.Spec.Resources.Requests {
-		if resourcehelper.IsSupportedPodLevelResource(v1.ResourceName(name)) {
+		if resourcehelper.IsSupportedPodLevelResourceWithOpts(v1.ResourceName(name), opts) {
 			return true
 		}
 	}
 
 	for name := range pod.Spec.Resources.Limits {
-		if resourcehelper.IsSupportedPodLevelResource(v1.ResourceName(name)) {
+		if resourcehelper.IsSupportedPodLevelResourceWithOpts(v1.ResourceName(name), opts) {
 			return true
 		}
 	}

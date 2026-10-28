@@ -43,10 +43,24 @@ func GetResourceRequestQuantity(pod *v1.Pod, resourceName v1.ResourceName) resou
 	}
 
 	// Supported pod level resources will be used instead of container level ones when available
-	hasPodLevelResources := utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) && resourcehelper.IsPodLevelResourcesSet(pod)
+	plrEnabled := utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources)
+	var opts resourcehelper.PodResourcesOptions
+	if resourceName == v1.ResourceEphemeralStorage {
+		opts = resourcehelper.PodResourcesOptions{
+			SkipPodLevelResources:                    !plrEnabled,
+			PodLevelResourcesEphemeralStorageEnabled: plrEnabled && utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResourcesEphemeralStorage),
+			ExcludeOverhead:                          true,
+		}
+	} else {
+		opts = resourcehelper.PodResourcesOptions{
+			SkipPodLevelResources:       !plrEnabled,
+			SkipContainerLevelResources: plrEnabled && hasNonEphemeralPodLevelResources(pod),
+			ExcludeOverhead:             true,
+		}
+	}
 
 	// TODO(pravk03): considering DRA Node Allocatable resources for eviction ranking.
-	if rQuantity, ok := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{SkipContainerLevelResources: hasPodLevelResources, ExcludeOverhead: true})[resourceName]; ok {
+	if rQuantity, ok := resourcehelper.PodRequests(pod, opts)[resourceName]; ok {
 		requestQuantity.Add(rQuantity)
 	}
 
@@ -74,6 +88,23 @@ func GetResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 	}
 
 	return requestQuantity.Value()
+}
+
+func hasNonEphemeralPodLevelResources(pod *v1.Pod) bool {
+	if pod == nil || pod.Spec.Resources == nil {
+		return false
+	}
+	for name := range pod.Spec.Resources.Requests {
+		if name != v1.ResourceEphemeralStorage {
+			return true
+		}
+	}
+	for name := range pod.Spec.Resources.Limits {
+		if name != v1.ResourceEphemeralStorage {
+			return true
+		}
+	}
+	return false
 }
 
 // ExtractResourceValueByContainerName extracts the value of a resource

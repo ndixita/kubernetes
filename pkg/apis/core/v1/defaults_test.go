@@ -1619,6 +1619,125 @@ func TestPodResourcesDefaults(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("pod-level ephemeral-storage request defaulting gated by PodLevelResourcesEphemeralStorage", func(t *testing.T) {
+		makePod := func() v1.Pod {
+			return v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:              resource.MustParse("1"),
+							v1.ResourceEphemeralStorage: resource.MustParse("20Gi"),
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "c1",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceEphemeralStorage: resource.MustParse("5Gi"),
+								},
+							},
+						},
+					},
+				},
+			}
+		}
+
+		// Gate disabled: ephemeral-storage request must not be defaulted into pod.Spec.Resources.Requests.
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, true)
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResourcesFixDefaulting, false)
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResourcesEphemeralStorage, false)
+		pDisabled := makePod()
+		corev1.SetDefaults_Pod(&pDisabled)
+		if _, exists := pDisabled.Spec.Resources.Requests[v1.ResourceEphemeralStorage]; exists {
+			t.Errorf("expected ephemeral-storage request not to be defaulted when gate is disabled, got %v", pDisabled.Spec.Resources.Requests)
+		}
+
+		// Gate enabled: ephemeral-storage request is defaulted from container request (5Gi).
+		featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+			features.PodLevelResources:                 true,
+			features.PodLevelResourcesFixDefaulting:    false,
+			features.PodLevelResourcesEphemeralStorage: true,
+		})
+		pEnabled := makePod()
+		corev1.SetDefaults_Pod(&pEnabled)
+		want := resource.MustParse("5Gi")
+		if got := pEnabled.Spec.Resources.Requests[v1.ResourceEphemeralStorage]; got.Cmp(want) != 0 {
+			t.Errorf("expected ephemeral-storage request %v, got %v", want, got)
+		}
+
+		// Gate enabled without container requests: pod ephemeral-storage limit (20Gi) defaults to request (20Gi).
+		pLimitOnly := v1.Pod{
+			Spec: v1.PodSpec{
+				Resources: &v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceEphemeralStorage: resource.MustParse("20Gi"),
+					},
+				},
+				Containers: []v1.Container{{Name: "c1"}},
+			},
+		}
+		corev1.SetDefaults_Pod(&pLimitOnly)
+		wantLimit := resource.MustParse("20Gi")
+		if got := pLimitOnly.Spec.Resources.Requests[v1.ResourceEphemeralStorage]; got.Cmp(wantLimit) != 0 {
+			t.Errorf("expected ephemeral-storage request %v from pod limit, got %v", wantLimit, got)
+		}
+
+		// Guaranteed containers + pod-level ephemeral-storage limit ONLY must NOT cross-default pod-level CPU/memory requests.
+		pGuaranteedCtr := v1.Pod{
+			Spec: v1.PodSpec{
+				Resources: &v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceEphemeralStorage: resource.MustParse("20Gi"),
+					},
+				},
+				Containers: []v1.Container{{
+					Name: "c1",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+					},
+				}},
+			},
+		}
+		corev1.SetDefaults_Pod(&pGuaranteedCtr)
+		if _, hasCPU := pGuaranteedCtr.Spec.Resources.Requests[v1.ResourceCPU]; hasCPU {
+			t.Errorf("expected no pod-level CPU request to be defaulted when only ephemeral-storage limit is set, got %v", pGuaranteedCtr.Spec.Resources.Requests)
+		}
+		if _, hasMem := pGuaranteedCtr.Spec.Resources.Requests[v1.ResourceMemory]; hasMem {
+			t.Errorf("expected no pod-level memory request to be defaulted when only ephemeral-storage limit is set, got %v", pGuaranteedCtr.Spec.Resources.Requests)
+		}
+
+		// Pod-level CPU limit ONLY + container ephemeral-storage request must NOT cross-default pod-level ephemeral-storage request.
+		pCPUOnly := v1.Pod{
+			Spec: v1.PodSpec{
+				Resources: &v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("1"),
+					},
+				},
+				Containers: []v1.Container{{
+					Name: "c1",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceEphemeralStorage: resource.MustParse("5Gi"),
+						},
+					},
+				}},
+			},
+		}
+		corev1.SetDefaults_Pod(&pCPUOnly)
+		if _, hasEph := pCPUOnly.Spec.Resources.Requests[v1.ResourceEphemeralStorage]; hasEph {
+			t.Errorf("expected no pod-level ephemeral-storage request when only CPU limit is set at pod level, got %v", pCPUOnly.Spec.Resources.Requests)
+		}
+	})
 }
 
 func TestPodHostNetworkDefaults(t *testing.T) {
