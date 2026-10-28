@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,14 +35,17 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/quota/v1/generic"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	watchtools "k8s.io/client-go/tools/watch"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/ktesting"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/pkg/controller"
 	replicationcontroller "k8s.io/kubernetes/pkg/controller/replication"
 	resourcequotacontroller "k8s.io/kubernetes/pkg/controller/resourcequota"
+	"k8s.io/kubernetes/pkg/features"
 	quotainstall "k8s.io/kubernetes/pkg/quota/v1/install"
 	"k8s.io/kubernetes/test/integration/framework"
 )
@@ -600,5 +604,139 @@ func newService(name string, svcType v1.ServiceType, allocateNodePort bool) *v1.
 				TargetPort: intstr.FromInt32(80),
 			}},
 		},
+	}
+}
+
+func TestPodLevelEphemeralStorageQuota(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.NodeDeclaredFeatures:              true,
+		features.PodLevelResources:                 true,
+		features.PodLevelResourcesFixDefaulting:    true,
+		features.PodLevelResourcesEphemeralStorage: true,
+	})
+
+	tCtx := ktesting.Init(t)
+	_, kubeConfig, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+		},
+	})
+	defer tearDownFn()
+
+	cs := clientset.NewForConfigOrDie(kubeConfig)
+	ns := framework.CreateNamespaceOrDie(cs, "plr-ephemeral-storage-quota", t)
+	defer framework.DeleteNamespaceOrDie(cs, ns, t)
+
+	informerFactory := informers.NewSharedInformerFactory(cs, controller.NoResyncPeriodFunc())
+	discoveryFunc := cs.Discovery().ServerPreferredNamespacedResources
+	listerFuncForResource := generic.ListerFuncForResourceFunc(informerFactory.ForResource)
+	qc, err := quotainstall.NewQuotaConfigurationForControllers(listerFuncForResource, informerFactory)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	ctrlCtx, cancelCtrl := context.WithCancel(tCtx)
+	informersStarted := make(chan struct{})
+	rqController, err := resourcequotacontroller.NewController(ctrlCtx, &resourcequotacontroller.ControllerOptions{
+		QuotaClient:               cs.CoreV1(),
+		ResourceQuotaInformer:     informerFactory.Core().V1().ResourceQuotas(),
+		ResyncPeriod:              controller.NoResyncPeriodFunc,
+		InformerFactory:           informerFactory,
+		ReplenishmentResyncPeriod: controller.NoResyncPeriodFunc,
+		DiscoveryFunc:             discoveryFunc,
+		IgnoredResourcesFunc:      qc.IgnoredResources,
+		InformersStarted:          informersStarted,
+		Registry:                  generic.NewRegistry(qc.Evaluators()),
+	})
+	if err != nil {
+		cancelCtrl()
+		t.Fatalf("unexpected err: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		rqController.Run(ctrlCtx, 2)
+	})
+	wg.Go(func() {
+		rqController.Sync(ctrlCtx, discoveryFunc, 30*time.Second)
+	})
+	informerFactory.StartWithContext(ctrlCtx)
+	close(informersStarted)
+	defer func() {
+		cancelCtrl()
+		wg.Wait()
+		informerFactory.Shutdown()
+	}()
+
+	quota := &v1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ephemeral-storage-quota",
+			Namespace: ns.Name,
+		},
+		Spec: v1.ResourceQuotaSpec{
+			Hard: v1.ResourceList{
+				v1.ResourceRequestsEphemeralStorage: resource.MustParse("10Gi"),
+				v1.ResourceLimitsEphemeralStorage:   resource.MustParse("20Gi"),
+			},
+		},
+	}
+	waitForQuota(t, quota, cs)
+
+	// Pod 1 has container ephemeral-storage limits summing to 24Gi (12Gi + 12Gi),
+	// which would exceed the 20Gi namespace limit quota if container limits were summed,
+	// but specifies a shared 15Gi pod-level ephemeral-storage limit and 6Gi request.
+	pod1 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "plr-storage-pod-1",
+			Namespace: ns.Name,
+		},
+		Spec: v1.PodSpec{
+			Resources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("6Gi")},
+				Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("15Gi")},
+			},
+			Containers: []v1.Container{
+				{
+					Name:  "c1",
+					Image: "busybox",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+						Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("12Gi")},
+					},
+				},
+				{
+					Name:  "c2",
+					Image: "busybox",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("3Gi")},
+						Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("12Gi")},
+					},
+				},
+			},
+		},
+	}
+	if _, err := cs.CoreV1().Pods(ns.Name).Create(tCtx, pod1, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("expected pod1 within pod-level ephemeral-storage quota to succeed, got: %v", err)
+	}
+
+	waitForUsedResourceQuota(t, cs, ns.Name, quota.Name, v1.ResourceList{
+		v1.ResourceRequestsEphemeralStorage: resource.MustParse("6Gi"),
+		v1.ResourceLimitsEphemeralStorage:   resource.MustParse("15Gi"),
+	})
+
+	// Pod 2 requests another 6Gi at pod level (6Gi + 6Gi = 12Gi > 10Gi quota) and must be rejected.
+	pod2 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "plr-storage-pod-2",
+			Namespace: ns.Name,
+		},
+		Spec: v1.PodSpec{
+			Resources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("6Gi")},
+				Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("6Gi")},
+			},
+			Containers: []v1.Container{{Name: "c1", Image: "busybox"}},
+		},
+	}
+	if _, err := cs.CoreV1().Pods(ns.Name).Create(tCtx, pod2, metav1.CreateOptions{}); !apierrors.IsForbidden(err) {
+		t.Fatalf("expected pod2 exceeding ephemeral-storage request quota to be Forbidden, got: %v", err)
 	}
 }

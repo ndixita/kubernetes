@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	kubeletstatsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/kubernetes/pkg/features"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
@@ -456,6 +457,86 @@ var _ = SIGDescribe("LocalStorageCapacityIsolationEviction", framework.WithSlow(
 	})
 })
 
+// LocalStorageCapacityIsolationEvictionPodLevelResources tests that pod-level ephemeral-storage limits
+// and emptyDir.sizeLimit precedence are enforced through kubelet evictions (KEP-6386).
+var _ = SIGDescribe("LocalStorageCapacityIsolationEvictionPodLevelResources", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), feature.LocalStorageCapacityIsolationQuota, feature.Eviction, framework.WithFeatureGate(features.PodLevelResources), framework.WithFeatureGate(features.PodLevelResourcesEphemeralStorage), func() {
+	f := framework.NewDefaultFramework("localstorage-eviction-plr-test")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	const evictionTestTimeout = 10 * time.Minute
+	ginkgo.Context(fmt.Sprintf(testContextFmt, "evictions due to pod-level ephemeral-storage violations"), func() {
+		tempSetCurrentKubeletConfig(f, func(ctx context.Context, initialConfig *kubeletconfig.KubeletConfiguration) {
+			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalMemoryAvailable): "0%"}
+			if initialConfig.FeatureGates == nil {
+				initialConfig.FeatureGates = make(map[string]bool)
+			}
+			initialConfig.FeatureGates[string(features.PodLevelResources)] = true
+			initialConfig.FeatureGates[string(features.PodLevelResourcesEphemeralStorage)] = true
+		})
+		podLimit := resource.MustParse("100Mi")
+		smallEmptyDirLimit := resource.MustParse("50Mi")
+		largePodLimit := resource.MustParse("200Mi")
+		useOverPodLimit := 105 /* Mb */
+		useOverEmptyDir := 60  /* Mb */
+		useUnderLimit := 80    /* Mb */
+
+		withPodStorageResources := func(pod *v1.Pod, req, lim *resource.Quantity) *v1.Pod {
+			pod.Spec.Resources = &v1.ResourceRequirements{}
+			if req != nil {
+				pod.Spec.Resources.Requests = v1.ResourceList{v1.ResourceEphemeralStorage: *req}
+			}
+			if lim != nil {
+				pod.Spec.Resources.Limits = v1.ResourceList{v1.ResourceEphemeralStorage: *lim}
+			}
+			return pod
+		}
+
+		runEvictionTest(f, evictionTestTimeout, noPressure, noStarvedResource, logDiskMetrics, []podEvictSpec{
+			{
+				evictionPriority: 1,
+				pod: withPodStorageResources(
+					diskConsumingCleanExitPod("pod-level-disk-limit", useOverPodLimit, &v1.VolumeSource{
+						EmptyDir: &v1.EmptyDirVolumeSource{},
+					}),
+					&podLimit, &podLimit,
+				),
+				wantEvictionAfterCleanExit: &cleanExitEviction{
+					message: fmt.Sprintf("exceeds pod-level limit (%s)", podLimit.String()),
+				},
+			},
+			{
+				evictionPriority: 1,
+				pod: withPodStorageResources(
+					diskConsumingCleanExitPod("emptydir-precedence-over-pod-limit", useOverEmptyDir, &v1.VolumeSource{
+						EmptyDir: &v1.EmptyDirVolumeSource{SizeLimit: &smallEmptyDirLimit},
+					}),
+					&smallEmptyDirLimit, &largePodLimit,
+				),
+				wantEvictionAfterCleanExit: &cleanExitEviction{
+					message: fmt.Sprintf("Usage of EmptyDir volume %q exceeds the limit %q", volumeName, smallEmptyDirLimit.String()),
+				},
+			},
+			{
+				evictionPriority: 0,
+				pod: withPodStorageResources(
+					diskConsumingPod("pod-level-disk-below-limit", useUnderLimit, &v1.VolumeSource{
+						EmptyDir: &v1.EmptyDirVolumeSource{},
+					}, v1.ResourceRequirements{}),
+					&podLimit, &podLimit,
+				),
+			},
+			{
+				evictionPriority: 0,
+				pod: withPodStorageResources(
+					diskConsumingPod("pod-level-memory-emptydir-excluded", useOverPodLimit, &v1.VolumeSource{
+						EmptyDir: &v1.EmptyDirVolumeSource{Medium: v1.StorageMediumMemory, SizeLimit: &podLimit},
+					}, v1.ResourceRequirements{}),
+					&podLimit, &podLimit,
+				),
+			},
+		})
+	})
+})
+
 // PriorityMemoryEvictionOrdering tests that the node responds to node memory pressure by evicting pods.
 // This test tests that the guaranteed pod is never evicted, and that the lower-priority pod is evicted before
 // the higher priority pod.
@@ -659,6 +740,70 @@ var _ = SIGDescribe("PriorityLocalStorageEvictionOrdering", framework.WithSlow()
 						v1.ResourceEphemeralStorage: resource.MustParse("300Mi"),
 					},
 				}),
+			},
+		}
+		specs[1].pod.Spec.PriorityClassName = highPriorityClassName
+		runEvictionTest(f, pressureTimeout, expectedNodeCondition, expectedStarvedResource, logDiskMetrics, specs)
+	})
+})
+
+// PriorityLocalStorageEvictionOrderingPodLevelResources tests node DiskPressure eviction priority
+// when ephemeral-storage requests and limits are specified at the pod level (KEP-6386).
+var _ = SIGDescribe("PriorityLocalStorageEvictionOrderingPodLevelResources", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), feature.Eviction, framework.WithFeatureGate(features.PodLevelResources), framework.WithFeatureGate(features.PodLevelResourcesEphemeralStorage), func() {
+	f := framework.NewDefaultFramework("priority-disk-eviction-ordering-plr-test")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	const expectedNodeCondition = v1.NodeDiskPressure
+	const expectedStarvedResource = v1.ResourceEphemeralStorage
+	const pressureTimeout = 15 * time.Minute
+
+	highPriorityClassName := f.BaseName + "-high-priority"
+	const highPriority = int32(999999999)
+
+	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
+		tempSetCurrentKubeletConfig(f, func(ctx context.Context, initialConfig *kubeletconfig.KubeletConfiguration) {
+			diskConsumed := resource.MustParse("4Gi")
+			summary := eventuallyGetSummary(ctx)
+			availableBytes := *(summary.Node.Fs.AvailableBytes)
+			if availableBytes <= uint64(diskConsumed.Value()) {
+				e2eskipper.Skipf("Too little disk free on the host for the PriorityLocalStorageEvictionOrderingPodLevelResources test to run")
+			}
+			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalNodeFsAvailable): fmt.Sprintf("%d", availableBytes-uint64(diskConsumed.Value()))}
+			initialConfig.EvictionMinimumReclaim = map[string]string{}
+			if initialConfig.FeatureGates == nil {
+				initialConfig.FeatureGates = make(map[string]bool)
+			}
+			initialConfig.FeatureGates[string(features.PodLevelResources)] = true
+			initialConfig.FeatureGates[string(features.PodLevelResourcesEphemeralStorage)] = true
+		})
+		ginkgo.BeforeEach(func(ctx context.Context) {
+			_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: highPriorityClassName}, Value: highPriority}, metav1.CreateOptions{})
+			if err != nil && !apierrors.IsAlreadyExists(err) {
+				framework.ExpectNoError(err, "failed to create priority class")
+			}
+		})
+		ginkgo.AfterEach(func(ctx context.Context) {
+			err := f.ClientSet.SchedulingV1().PriorityClasses().Delete(ctx, highPriorityClassName, metav1.DeleteOptions{})
+			framework.ExpectNoError(err)
+		})
+
+		withinPodRequest := diskConsumingPod("pod-within-ephemeral-request", 250 /* Mb */, &v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}}, v1.ResourceRequirements{})
+		withinPodRequest.Spec.Resources = &v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("300Mi")},
+			Limits:   v1.ResourceList{v1.ResourceEphemeralStorage: resource.MustParse("300Mi")},
+		}
+
+		specs := []podEvictSpec{
+			{
+				evictionPriority: 2,
+				pod:              diskConsumingPod("best-effort-disk", lotsOfDisk, &v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}}, v1.ResourceRequirements{}),
+			},
+			{
+				evictionPriority: 1,
+				pod:              diskConsumingPod("high-priority-disk", lotsOfDisk, &v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}}, v1.ResourceRequirements{}),
+			},
+			{
+				evictionPriority: 0,
+				pod:              withinPodRequest,
 			},
 		}
 		specs[1].pod.Spec.PriorityClassName = highPriorityClassName

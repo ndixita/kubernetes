@@ -25,6 +25,7 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -562,4 +563,96 @@ var _ = SIGDescribe("Pod Level Resources Fix Defaulting", framework.WithSerial()
 	})
 
 	podLevelResourcesFixDefaultingTests(f)
+})
+
+var _ = SIGDescribe("Pod Level Ephemeral Storage", framework.WithFeatureGate(features.PodLevelResources), framework.WithFeatureGate(features.PodLevelResourcesEphemeralStorage), func() {
+	f := framework.NewDefaultFramework("pod-level-ephemeral-storage-tests")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+
+	ginkgo.BeforeEach(func(ctx context.Context) {
+		_, err := e2enode.GetRandomReadySchedulableNode(ctx, f.ClientSet)
+		framework.ExpectNoError(err, "select a ready schedulable node")
+
+		if framework.NodeOSDistroIs("windows") {
+			e2eskipper.Skipf("not supported on windows -- skipping")
+		}
+	})
+
+	ginkgo.It("schedules pod with pod-level ephemeral-storage limit without cross-defaulting cpu/memory or changing QoS", func(ctx context.Context) {
+		testPod := &v1.Pod{
+			ObjectMeta: makeObjectMetadata("testpod-eph-fit", f.Namespace.Name),
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name:    "c1",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
+						Command: []string{"/bin/sh", "-c", cmd},
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceCPU:              resource.MustParse("50m"),
+								v1.ResourceMemory:           resource.MustParse("50Mi"),
+								v1.ResourceEphemeralStorage: resource.MustParse("50Mi"),
+							},
+							Limits: v1.ResourceList{
+								v1.ResourceCPU:              resource.MustParse("100m"),
+								v1.ResourceMemory:           resource.MustParse("100Mi"),
+								v1.ResourceEphemeralStorage: resource.MustParse("100Mi"),
+							},
+						},
+					},
+				},
+				Resources: &v1.ResourceRequirements{
+					Limits: v1.ResourceList{
+						v1.ResourceEphemeralStorage: resource.MustParse("200Mi"),
+					},
+				},
+			},
+		}
+
+		podClient := e2epod.NewPodClient(f)
+		pod := podClient.CreateSync(ctx, testPod)
+		ginkgo.DeferCleanup(e2epod.DeletePodWithWait, f.ClientSet, pod)
+
+		verifyQoS(*pod, v1.PodQOSBurstable)
+		gomega.Expect(pod.Spec.Resources).NotTo(gomega.BeNil())
+		ephReq := pod.Spec.Resources.Requests[v1.ResourceEphemeralStorage]
+		ephLim := pod.Spec.Resources.Limits[v1.ResourceEphemeralStorage]
+		gomega.Expect(ephReq.Cmp(resource.MustParse("50Mi"))).To(gomega.BeZero())
+		gomega.Expect(ephLim.Cmp(resource.MustParse("200Mi"))).To(gomega.BeZero())
+		gomega.Expect(pod.Spec.Resources.Requests).NotTo(gomega.HaveKey(v1.ResourceCPU))
+		gomega.Expect(pod.Spec.Resources.Requests).NotTo(gomega.HaveKey(v1.ResourceMemory))
+	})
+
+	ginkgo.It("leaves pod unschedulable with Insufficient ephemeral-storage when pod-level request exceeds node allocatable", func(ctx context.Context) {
+		unschedPod := &v1.Pod{
+			ObjectMeta: makeObjectMetadata("testpod-eph-unsched", f.Namespace.Name),
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name:    "c1",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
+						Command: []string{"/bin/sh", "-c", cmd},
+					},
+				},
+				Resources: &v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceEphemeralStorage: resource.MustParse("1000Ti"),
+					},
+				},
+			},
+		}
+
+		created, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, unschedPod, metav1.CreateOptions{})
+		framework.ExpectNoError(err, "create unschedulable pod")
+		ginkgo.DeferCleanup(e2epod.DeletePodWithWait, f.ClientSet, created)
+
+		err = e2epod.WaitForPodNameUnschedulableInNamespace(ctx, f.ClientSet, created.Name, f.Namespace.Name)
+		framework.ExpectNoError(err, "wait for pod to become unschedulable")
+
+		observed, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, created.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "get unschedulable pod")
+		schedCond := e2epod.FindPodConditionByType(&observed.Status, v1.PodScheduled)
+		gomega.Expect(schedCond).NotTo(gomega.BeNil())
+		gomega.Expect(schedCond.Message).To(gomega.ContainSubstring("Insufficient ephemeral-storage"))
+	})
 })

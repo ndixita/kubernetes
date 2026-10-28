@@ -3295,3 +3295,117 @@ func TestDynamicResourcesFilter(t *testing.T) {
 		})
 	}
 }
+
+func TestPodLevelEphemeralStorageScheduling(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.NodeDeclaredFeatures:              true,
+		features.PodLevelResources:                 true,
+		features.PodLevelResourcesFixDefaulting:    true,
+		features.PodLevelResourcesEphemeralStorage: true,
+	})
+
+	nodeSmallCapable := st.MakeNode().Name("node-small-capable").
+		Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:              "4",
+			v1.ResourceMemory:           "8Gi",
+			v1.ResourceEphemeralStorage: "5Gi",
+		}).
+		DeclaredFeatures([]string{string(features.PodLevelResourcesEphemeralStorage)}).Obj()
+
+	nodeLargeCapable := st.MakeNode().Name("node-large-capable").
+		Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:              "4",
+			v1.ResourceMemory:           "8Gi",
+			v1.ResourceEphemeralStorage: "20Gi",
+		}).
+		DeclaredFeatures([]string{string(features.PodLevelResourcesEphemeralStorage)}).Obj()
+
+	nodeHugeLegacy := st.MakeNode().Name("node-huge-legacy").
+		Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:              "4",
+			v1.ResourceMemory:           "8Gi",
+			v1.ResourceEphemeralStorage: "50Gi",
+		}).Obj()
+	nodeHugeLegacy.Status.DeclaredFeatures = []string{}
+
+	tests := []struct {
+		name                    string
+		pod                     *v1.Pod
+		expectedNode            string
+		wantUnschedulableReason string
+	}{
+		{
+			name: "pod-level ephemeral-storage request fits capable node and skips legacy node without declared feature",
+			pod: st.MakePod().Name("pod-plr-eph-fit").
+				PodLevelResourceRequests(map[v1.ResourceName]string{
+					v1.ResourceEphemeralStorage: "10Gi",
+				}).
+				Container(imageutils.GetPauseImageName()).Obj(),
+			expectedNode: "node-large-capable",
+		},
+		{
+			name: "pod-level ephemeral-storage request exceeding capable nodes is unschedulable with Insufficient ephemeral-storage",
+			pod: st.MakePod().Name("pod-plr-eph-too-large").
+				PodLevelResourceRequests(map[v1.ResourceName]string{
+					v1.ResourceEphemeralStorage: "30Gi",
+				}).
+				Container(imageutils.GetPauseImageName()).Obj(),
+			wantUnschedulableReason: "Insufficient ephemeral-storage",
+		},
+		{
+			name: "pod with only pod-level cpu and container ephemeral-storage does not require PodLevelResourcesEphemeralStorage node feature",
+			pod: st.MakePod().Name("pod-cpu-only-container-eph").
+				PodLevelResourceRequests(map[v1.ResourceName]string{
+					v1.ResourceCPU: "100m",
+				}).
+				Req(map[v1.ResourceName]string{
+					v1.ResourceCPU:              "100m",
+					v1.ResourceEphemeralStorage: "30Gi",
+				}).Obj(),
+			expectedNode: "node-huge-legacy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testCtx := initTest(t, "pod-level-ephemeral-storage")
+			cs := testCtx.ClientSet
+			ns := testCtx.NS.Name
+
+			for _, node := range []*v1.Node{nodeSmallCapable.DeepCopy(), nodeLargeCapable.DeepCopy(), nodeHugeLegacy.DeepCopy()} {
+				if _, err := createNode(cs, node); err != nil {
+					t.Fatalf("Failed to create node %q: %v", node.Name, err)
+				}
+			}
+			if err := testutils.WaitForNodesInCache(testCtx.Ctx, testCtx.Scheduler, 3); err != nil {
+				t.Fatalf("Failed to wait for nodes in cache: %v", err)
+			}
+
+			pod := tt.pod.DeepCopy()
+			pod.Namespace = ns
+			createdPod, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, pod, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Failed to create pod %s/%s: %v", ns, pod.Name, err)
+			}
+			defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{createdPod})
+
+			if tt.expectedNode != "" {
+				if err := wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false, podScheduledIn(cs, ns, createdPod.Name, []string{tt.expectedNode})); err != nil {
+					t.Fatalf("Expected pod %s/%s to schedule onto %q: %v", ns, createdPod.Name, tt.expectedNode, err)
+				}
+			} else {
+				if err := wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false, podUnschedulable(cs, ns, createdPod.Name)); err != nil {
+					t.Fatalf("Expected pod %s/%s to be unschedulable: %v", ns, createdPod.Name, err)
+				}
+				observedPod, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, createdPod.Name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatalf("Failed to get pod %s/%s: %v", ns, createdPod.Name, err)
+				}
+				_, condition := podutil.GetPodCondition(&observedPod.Status, v1.PodScheduled)
+				if condition == nil || !strings.Contains(condition.Message, tt.wantUnschedulableReason) {
+					t.Fatalf("Expected PodScheduled condition message to contain %q, got %+v", tt.wantUnschedulableReason, condition)
+				}
+			}
+		})
+	}
+}
