@@ -19,6 +19,7 @@ package kuberuntime
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"testing"
 	"time"
@@ -577,9 +578,22 @@ func TestMergeResourceConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			var origUnified map[string]string
+			var origHugePages map[int64]int64
+			if tt.source != nil {
+				origUnified = maps.Clone(tt.source.Unified)
+				origHugePages = maps.Clone(tt.source.HugePageLimit)
+			}
+
 			merged := mergeResourceConfig(tt.source, tt.update)
 
 			assert.Equal(t, tt.expected, merged)
+			if origUnified != nil {
+				assert.Equal(t, origUnified, tt.source.Unified, "mergeResourceConfig must not mutate source.Unified")
+			}
+			if origHugePages != nil {
+				assert.Equal(t, origHugePages, tt.source.HugePageLimit, "mergeResourceConfig must not mutate source.HugePageLimit")
+			}
 		})
 	}
 }
