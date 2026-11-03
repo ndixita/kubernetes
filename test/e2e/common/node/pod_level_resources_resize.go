@@ -642,6 +642,252 @@ func doPodLevelResourcesMemoryLimitDecreaseTest(f *framework.Framework) {
 		ginkgo.By("deleting pod")
 		podClient.DeleteSync(ctx, testPod.Name, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
 	})
+
+	// When all containers specify explicit memory limits, changing only pod.spec.resources.limits.memory
+	// leaves ContainersToUpdate[memory] empty and sets only UpdatePodLevelResources.
+	framework.It("decrease pod-level memory limit below usage when containers have explicit limits", framework.WithKubeletMinVersion("1.38"), func(ctx context.Context) {
+		podClient := e2epod.NewPodClient(f)
+		originalPLR := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("160Mi"),
+			},
+		}
+		containers := []podresize.ResizableContainerInfo{
+			{
+				Name:      "c1",
+				Resources: &cgroups.ContainerResources{MemReq: "16Mi", MemLim: "64Mi"},
+			},
+			{
+				Name:      "c2",
+				Resources: &cgroups.ContainerResources{MemReq: "16Mi", MemLim: "64Mi"},
+			},
+		}
+
+		ginkgo.By("creating and verifying pod with explicit container memory limits")
+		testPod := createPodWithMemoryEmptyDirPLR(ctx, f, podClient, containers, originalPLR, "128Mi")
+		framework.ExpectNoError(podresize.VerifyPodCgroupValues(ctx, f, testPod), "verify initial pod cgroup values for Pod %q", testPod.Name)
+
+		// Keep each container under its 64Mi limit while pushing aggregate pod usage above 80Mi.
+		ginkgo.By("allocating 40Mi in each container so aggregate pod usage exceeds 64Mi")
+		for _, ctr := range containers {
+			_, _, err := e2epod.ExecCommandInContainerWithFullOutput(f, testPod.Name, ctr.Name,
+				"dd", "if=/dev/zero", fmt.Sprintf("of=/cache/%s", ctr.Name), "bs=1M", "count=40")
+			framework.ExpectNoError(err, "allocate 40Mi in memory-backed emptyDir for container %q in Pod %q", ctr.Name, testPod.Name)
+		}
+
+		// Wait 2 * maxHousekeepingInterval after writing so cAdvisor caches the post-allocation usage before resizing.
+		ginkgo.By("waiting for stats scraping after memory allocation")
+		const scrapingDelay = 30 * time.Second
+		time.Sleep(scrapingDelay)
+
+		ginkgo.By("patching pod with a viable lowered pod-level memory limit (128Mi)")
+		viableLoweredPLR := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		}
+		patch := podresize.MakeResizePatch(containers, containers, originalPLR, viableLoweredPLR)
+		testPod, pErr := f.ClientSet.CoreV1().Pods(testPod.Namespace).Patch(ctx, testPod.Name,
+			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
+		framework.ExpectNoError(pErr, "patch pod for viable lowered pod-level memory limit")
+		podresize.VerifyPodResources(testPod, containers, viableLoweredPLR)
+		testPod = podresize.WaitForPodResizeActuation(ctx, f, podClient, testPod, containers)
+		framework.ExpectNoError(podresize.VerifyPodCgroupValues(ctx, f, testPod), "verify viable lowered pod cgroup values for Pod %q", testPod.Name)
+
+		ginkgo.By("patching pod with a pod-level memory limit (64Mi) below aggregate pod usage")
+		nonViableLoweredPLR := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+		}
+		patch = podresize.MakeResizePatch(containers, containers, viableLoweredPLR, nonViableLoweredPLR)
+		testPod, pErr = f.ClientSet.CoreV1().Pods(testPod.Namespace).Patch(ctx, testPod.Name,
+			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
+		framework.ExpectNoError(pErr, "patch pod for non-viable lowered pod-level memory limit")
+
+		testPod = waitForPodMemoryLimitBelowUsageError(ctx, f, testPod, nonViableLoweredPLR)
+		framework.ExpectNoError(cgroups.VerifyPodCgroups(ctx, f, testPod, &cgroups.ContainerResources{MemLim: "128Mi"}),
+			"verify pod cgroup memory limit remained at 128Mi for Pod %q", testPod.Name)
+		framework.ExpectNoError(podresize.VerifyPodStatusResources(testPod, containers), "verify container resource status for Pod %q", testPod.Name)
+		framework.ExpectNoError(podresize.VerifyPodRestarts(ctx, f, testPod, containers), "verify containers did not restart for Pod %q", testPod.Name)
+
+		ginkgo.By("reverting pod-level memory limit back to 160Mi")
+		patch = podresize.MakeResizePatch(containers, containers, nonViableLoweredPLR, originalPLR)
+		testPod, pErr = f.ClientSet.CoreV1().Pods(testPod.Namespace).Patch(ctx, testPod.Name,
+			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
+		framework.ExpectNoError(pErr, "patch pod back to original pod-level memory limit")
+		podresize.VerifyPodResources(testPod, containers, originalPLR)
+		testPod = podresize.WaitForPodResizeActuation(ctx, f, podClient, testPod, containers)
+		framework.ExpectNoError(podresize.VerifyPodCgroupValues(ctx, f, testPod), "verify restored pod cgroup values for Pod %q", testPod.Name)
+
+		ginkgo.By("deleting pod")
+		podClient.DeleteSync(ctx, testPod.Name, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+	})
+
+	// Omitting pod.spec.resources.limits.memory while at least one container omits limits.memory
+	// keeps the pod cgroup unbounded ("max", read back as -1) so adding a finite pod limit must
+	// still be validated as a limit decrease against aggregate pod usage.
+	framework.It("add pod-level memory limit below usage on unbounded pod", framework.WithKubeletMinVersion("1.38"), func(ctx context.Context) {
+		podClient := e2epod.NewPodClient(f)
+		originalPLR := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+		}
+		// c1 sets a limit so CheckPodResized does not treat the pod as pod-level-only,
+		// while c2 omits limits.memory so API defaulting keeps pod.spec.resources.limits unset.
+		containers := []podresize.ResizableContainerInfo{
+			{
+				Name:      "c1",
+				Resources: &cgroups.ContainerResources{MemReq: "16Mi", MemLim: "64Mi"},
+			},
+			{
+				Name:      "c2",
+				Resources: &cgroups.ContainerResources{MemReq: "16Mi"},
+			},
+		}
+
+		ginkgo.By("creating and verifying pod with unbounded pod-level memory limit")
+		testPod := createPodWithMemoryEmptyDirPLR(ctx, f, podClient, containers, originalPLR, "128Mi")
+		framework.ExpectNoError(cgroups.VerifyPodCgroups(ctx, f, testPod, &cgroups.ContainerResources{MemLim: "0"}),
+			"verify initial pod cgroup memory limit is unbounded for Pod %q", testPod.Name)
+
+		// Each container uses ~40Mi (< 64Mi), so container-level validation passes for c2
+		// and only pod-level validation catches aggregate pod usage (>= 80Mi) exceeding 64Mi.
+		ginkgo.By("allocating 40Mi in each container so only aggregate pod usage exceeds 64Mi")
+		for _, ctr := range containers {
+			_, _, err := e2epod.ExecCommandInContainerWithFullOutput(f, testPod.Name, ctr.Name,
+				"dd", "if=/dev/zero", fmt.Sprintf("of=/cache/%s", ctr.Name), "bs=1M", "count=40")
+			framework.ExpectNoError(err, "allocate 40Mi in memory-backed emptyDir for container %q in Pod %q", ctr.Name, testPod.Name)
+		}
+
+		ginkgo.By("waiting for stats scraping after memory allocation")
+		const scrapingDelay = 30 * time.Second
+		time.Sleep(scrapingDelay)
+
+		ginkgo.By("patching unbounded pod with a pod-level memory limit (64Mi) below aggregate pod usage")
+		nonViableBoundedPLR := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+		}
+		patch := podresize.MakeResizePatch(containers, containers, originalPLR, nonViableBoundedPLR)
+		testPod, pErr := f.ClientSet.CoreV1().Pods(testPod.Namespace).Patch(ctx, testPod.Name,
+			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
+		framework.ExpectNoError(pErr, "patch unbounded pod with non-viable pod-level memory limit")
+
+		testPod = waitForPodMemoryLimitBelowUsageError(ctx, f, testPod, nonViableBoundedPLR)
+		framework.ExpectNoError(cgroups.VerifyPodCgroups(ctx, f, testPod, &cgroups.ContainerResources{MemLim: "0"}),
+			"verify pod cgroup memory limit remained unbounded for Pod %q", testPod.Name)
+		framework.ExpectNoError(podresize.VerifyPodStatusResources(testPod, containers), "verify container resource status for Pod %q", testPod.Name)
+		framework.ExpectNoError(podresize.VerifyPodRestarts(ctx, f, testPod, containers), "verify containers did not restart for Pod %q", testPod.Name)
+
+		ginkgo.By("patching pod with a viable pod-level memory limit (160Mi)")
+		viableBoundedPLR := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("160Mi"),
+			},
+		}
+		patch = podresize.MakeResizePatch(containers, containers, nonViableBoundedPLR, viableBoundedPLR)
+		testPod, pErr = f.ClientSet.CoreV1().Pods(testPod.Namespace).Patch(ctx, testPod.Name,
+			types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
+		framework.ExpectNoError(pErr, "patch pod with viable pod-level memory limit")
+		podresize.VerifyPodResources(testPod, containers, viableBoundedPLR)
+		testPod = podresize.WaitForPodResizeActuation(ctx, f, podClient, testPod, containers)
+		framework.ExpectNoError(podresize.VerifyPodCgroupValues(ctx, f, testPod), "verify bounded pod cgroup values for Pod %q", testPod.Name)
+
+		ginkgo.By("deleting pod")
+		podClient.DeleteSync(ctx, testPod.Name, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+	})
+}
+
+func createPodWithMemoryEmptyDirPLR(ctx context.Context, f *framework.Framework, podClient *e2epod.PodClient, containers []podresize.ResizableContainerInfo, podResources *v1.ResourceRequirements, emptyDirSizeLimit string) *v1.Pod {
+	tStamp := strconv.Itoa(time.Now().Nanosecond())
+	sizeLimit := resource.MustParse(emptyDirSizeLimit)
+	testPod := podresize.MakePodWithResizableContainers(f.Namespace.Name, "", tStamp, containers, podResources)
+	testPod.GenerateName = "resize-test-"
+	testPod.Spec.Volumes = []v1.Volume{{
+		Name: "mem-vol",
+		VolumeSource: v1.VolumeSource{
+			EmptyDir: &v1.EmptyDirVolumeSource{
+				Medium:    v1.StorageMediumMemory,
+				SizeLimit: &sizeLimit,
+			},
+		},
+	}}
+	for i := range testPod.Spec.Containers {
+		testPod.Spec.Containers[i].VolumeMounts = []v1.VolumeMount{{
+			Name:      "mem-vol",
+			MountPath: "/cache",
+		}}
+	}
+	testPod = e2epod.MustMixinRestrictedPodSecurity(testPod)
+	cgroups.ConfigureHostPathForPodCgroup(testPod)
+
+	newPod := podClient.CreateSync(ctx, testPod)
+	podresize.VerifyPodResources(newPod, containers, podResources)
+	podresize.VerifyPodResizePolicy(newPod, containers)
+	framework.ExpectNoError(podresize.VerifyPodStatusResources(newPod, containers), "verify container resource status for Pod %q", newPod.Name)
+	framework.ExpectNoError(podresize.VerifyPodContainersCgroupValues(ctx, f, newPod, containers), "verify container cgroup values for Pod %q", newPod.Name)
+	return newPod
+}
+
+func waitForPodMemoryLimitBelowUsageError(ctx context.Context, f *framework.Framework, pod *v1.Pod, nonViablePLR *v1.ResourceRequirements) *v1.Pod {
+	expectedMsg := regexp.MustCompile(`pod memory limit \(\d+\) below current usage`)
+	var latestPod *v1.Pod
+	framework.ExpectNoError(framework.Gomega().
+		Eventually(ctx, framework.RetryNotFound(framework.GetObject(f.ClientSet.CoreV1().Pods(pod.Namespace).Get, pod.Name, metav1.GetOptions{}))).
+		WithTimeout(f.Timeouts.PodStart).
+		Should(framework.MakeMatcher(func(p *v1.Pod) (func() string, error) {
+			latestPod = p
+			if podresize.VerifyPodLevelStatusResources(p, nonViablePLR) == nil {
+				return nil, gomega.StopTrying("non-viable pod-level memory resize unexpectedly completed")
+			}
+
+			var inProgressCondition *v1.PodCondition
+			for i, condition := range p.Status.Conditions {
+				switch condition.Type {
+				case v1.PodResizeInProgress:
+					inProgressCondition = &p.Status.Conditions[i]
+				case v1.PodResizePending:
+					return func() string {
+						return fmt.Sprintf("pod should not have PodResizePending condition, got reason=%s, message=%q", condition.Reason, condition.Message)
+					}, nil
+				}
+			}
+
+			if inProgressCondition == nil {
+				return func() string { return "PodResizeInProgress condition is not present yet" }, nil
+			}
+			if inProgressCondition.Reason != v1.PodReasonError {
+				return func() string {
+					return fmt.Sprintf("expected PodResizeInProgress reason %q, got %q (message=%q)", v1.PodReasonError, inProgressCondition.Reason, inProgressCondition.Message)
+				}, nil
+			}
+			if !expectedMsg.MatchString(inProgressCondition.Message) {
+				return func() string {
+					return fmt.Sprintf("expected PodResizeInProgress message %q to match %q", inProgressCondition.Message, expectedMsg)
+				}, nil
+			}
+			return nil, nil
+		})), "wait for Pod %q to report a pod-level memory limit below current usage error", pod.Name,
+	)
+	return latestPod
 }
 
 func doInitialCreationNoResizeEventTest(f *framework.Framework) {

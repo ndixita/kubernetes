@@ -5616,6 +5616,7 @@ func TestValidatePodResizeAction(t *testing.T) {
 		currentResources, desiredResources     resourceRequirements
 		currentPodMemLimit, desiredPodMemLimit *int64
 		containerMemoryUsage, podMemoryUsage   *uint64
+		podLevelOnly                           bool
 		expectedError                          bool
 	}{
 		{
@@ -5804,6 +5805,51 @@ func TestValidatePodResizeAction(t *testing.T) {
 			podMemoryUsage:       nil,
 			expectedError:        true,
 		},
+		{
+			testName: "Decrease pod-level limits only, high usage",
+			currentResources: resourceRequirements{
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			desiredResources: resourceRequirements{
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			currentPodMemLimit:   ptr.To[int64](200),
+			desiredPodMemLimit:   ptr.To[int64](100),
+			containerMemoryUsage: ptr.To[uint64](50),
+			podMemoryUsage:       ptr.To[uint64](150),
+			podLevelOnly:         true,
+			expectedError:        true,
+		},
+		{
+			testName: "Add pod limit from unbounded (-1), high usage",
+			currentResources: resourceRequirements{
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			desiredResources: resourceRequirements{
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			currentPodMemLimit:   ptr.To[int64](-1),
+			desiredPodMemLimit:   ptr.To[int64](100),
+			containerMemoryUsage: ptr.To[uint64](50),
+			podMemoryUsage:       ptr.To[uint64](150),
+			podLevelOnly:         true,
+			expectedError:        true,
+		},
+		{
+			testName: "Unbounded (-1) pod limit unchanged, high usage",
+			currentResources: resourceRequirements{
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			desiredResources: resourceRequirements{
+				memoryRequest: 100, memoryLimit: 100,
+			},
+			currentPodMemLimit:   ptr.To[int64](-1),
+			desiredPodMemLimit:   ptr.To[int64](-1),
+			containerMemoryUsage: ptr.To[uint64](50),
+			podMemoryUsage:       ptr.To[uint64](150),
+			podLevelOnly:         true,
+			expectedError:        false,
+		},
 	} {
 		t.Run(tc.testName, func(t *testing.T) {
 			tCtx := ktesting.Init(t)
@@ -5836,6 +5882,11 @@ func TestValidatePodResizeAction(t *testing.T) {
 
 			actions := podActions{
 				ContainersToUpdate: containersToUpdate,
+			}
+			if tc.podLevelOnly {
+				actions = podActions{
+					UpdatePodLevelResources: true,
+				}
 			}
 
 			podStats := &statsapi.PodStats{
@@ -7087,4 +7138,143 @@ func TestSyncResultErrorsMetric(t *testing.T) {
 			))
 		})
 	}
+}
+
+func TestPodLevelResizeRetryAndActuatedCleanup(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("unsupported OS")
+	}
+
+	tCtx := ktesting.Init(t)
+	logger := tCtx.Logger()
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.InPlacePodVerticalScaling:               true,
+		features.PodLevelResources:                       true,
+		features.InPlacePodLevelResourcesVerticalScaling: true,
+	})
+
+	fakeRuntime, _, m, err := createTestRuntimeManager(tCtx)
+	require.NoError(t, err)
+	m.cpuCFSQuota = true
+
+	pod, kps := makeBasePodAndStatus()
+	pod.Spec.Containers = pod.Spec.Containers[:1]
+	kps.ContainerStatuses = kps.ContainerStatuses[:1]
+	_, fakeContainers := makeAndSetFakePod(tCtx, m, fakeRuntime, pod)
+	kps.ContainerStatuses[0].ID = kubecontainer.ContainerID{Type: "testRuntime", ID: fakeContainers[0].Id}
+	kps.ActiveContainerStatuses = kps.ContainerStatuses
+
+	// Pod-level sets memory only; pod-level CPU shares are derived from container CPU requests.
+	pod.Spec.Resources = &v1.ResourceRequirements{
+		Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("200Mi")},
+	}
+	pod.Spec.Containers[0].Resources = v1.ResourceRequirements{
+		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("150m"), v1.ResourceMemory: resource.MustParse("100Mi")},
+		Limits:   v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m"), v1.ResourceMemory: resource.MustParse("100Mi")},
+	}
+	pod.Spec.Containers[0].ResizePolicy = []v1.ContainerResizePolicy{
+		{ResourceName: v1.ResourceCPU, RestartPolicy: v1.NotRequired},
+		{ResourceName: v1.ResourceMemory, RestartPolicy: v1.NotRequired},
+	}
+	kps.ContainerStatuses[0].Hash = kubecontainer.HashContainer(&pod.Spec.Containers[0])
+	m.InitializeActuatedPod(logger, pod)
+
+	// Shrink only the container CPU request (150m -> 100m) while pod.Spec.Resources stays unchanged.
+	pod.Spec.Containers[0].Resources.Requests[v1.ResourceCPU] = resource.MustParse("100m")
+	kps.ContainerStatuses[0].Hash = kubecontainer.HashContainer(&pod.Spec.Containers[0])
+
+	m.runtimeHelper = &containertest.FakeRuntimeHelper{
+		PodStats: map[types.UID]*statsapi.PodStats{
+			pod.UID: {Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](1024)}},
+		},
+	}
+
+	mockCM := cmtesting.NewMockContainerManager(t)
+	mockCM.EXPECT().PodHasExclusiveCPUs(logger, mock.Anything).Return(false).Maybe()
+	mockCM.EXPECT().ContainerHasExclusiveCPUs(logger, mock.Anything, mock.Anything).Return(false).Maybe()
+	m.containerManager = mockCM
+
+	// Sync 1: container CRI update succeeds, then SetPodCgroupConfig fails transiently.
+	actions1 := m.computePodActions(tCtx, pod, kps, false)
+	require.Len(t, actions1.ContainersToUpdate[v1.ResourceCPU], 1)
+	assert.False(t, actions1.UpdatePodLevelResources)
+
+	mockPCM1 := cmtesting.NewMockPodContainerManager(t)
+	mockCM.EXPECT().NewPodContainerManager().Return(mockPCM1).Once()
+	mockPCM1.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+		Memory: ptr.To[int64](100 * 1024 * 1024),
+	}, nil)
+	mockPCM1.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+		CPUShares: new(cm.MilliCPUToShares(150)),
+		CPUQuota:  new(cm.MilliCPUToQuota(200, cm.QuotaPeriod)),
+	}, nil)
+	mockPCM1.EXPECT().SetPodCgroupConfig(logger, mock.Anything, mock.Anything).Return(errors.New("transient cgroup failure")).Once()
+
+	res1 := m.doPodResizeAction(tCtx, pod, kps, actions1)
+	require.Error(t, res1.Error)
+
+	// Container actuated state already matches desired, and pod.Spec.Resources never changed,
+	// yet pendingPodResize keeps resize in progress and triggers UpdatePodResources on retry.
+	assert.True(t, m.IsPodResizeInProgress(pod, kps), "resize must remain in progress until pod cgroup update succeeds")
+	actions2 := m.computePodActions(tCtx, pod, kps, false)
+	assert.Empty(t, actions2.ContainersToUpdate, "container already updated in runtime")
+	assert.False(t, actions2.UpdatePodLevelResources)
+	assert.True(t, actions2.UpdatePodResources, "pendingPodResize must schedule pod cgroup retry")
+
+	// Sync 2: retry succeeds and clears pendingPodResize.
+	mockPCM2 := cmtesting.NewMockPodContainerManager(t)
+	mockCM.EXPECT().NewPodContainerManager().Return(mockPCM2).Once()
+	mockPCM2.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+		Memory: ptr.To[int64](100 * 1024 * 1024),
+	}, nil)
+	mockPCM2.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+		CPUShares: new(cm.MilliCPUToShares(150)),
+		CPUQuota:  new(cm.MilliCPUToQuota(200, cm.QuotaPeriod)),
+	}, nil)
+	mockPCM2.EXPECT().SetPodCgroupConfig(logger, mock.Anything, mock.MatchedBy(func(rc *cm.ResourceConfig) bool {
+		return rc != nil && rc.CPUShares != nil && *rc.CPUShares == cm.MilliCPUToShares(100)
+	})).Return(nil).Once()
+
+	res2 := m.doPodResizeAction(tCtx, pod, kps, actions2)
+	require.NoError(t, res2.Error)
+	assert.False(t, m.IsPodResizeInProgress(pod, kps))
+	actions3 := m.computePodActions(tCtx, pod, kps, false)
+	assert.False(t, actions3.UpdatePodResources)
+
+	// Verify updateActuatedPodLevelResources deletes unset keys instead of storing zero Quantities.
+	require.NoError(t, m.actuatedState.SetPodLevelResources(logger, pod.UID, &v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU:    resource.MustParse("150m"),
+			v1.ResourceMemory: resource.MustParse("150Mi"),
+		},
+		Limits: v1.ResourceList{
+			v1.ResourceCPU:    resource.MustParse("300m"),
+			v1.ResourceMemory: resource.MustParse("300Mi"),
+		},
+	}))
+	mockPCM3 := cmtesting.NewMockPodContainerManager(t)
+	mockCM.EXPECT().NewPodContainerManager().Return(mockPCM3).Once()
+	mockPCM3.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+		Memory: ptr.To[int64](100 * 1024 * 1024),
+	}, nil)
+	mockPCM3.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+		CPUShares: new(cm.MilliCPUToShares(100)),
+		CPUQuota:  new(cm.MilliCPUToQuota(200, cm.QuotaPeriod)),
+	}, nil)
+	res3 := m.doPodResizeAction(tCtx, pod, kps, podActions{
+		UpdatePodLevelResources: true,
+		SandboxID:               "sandbox-id",
+	})
+	require.NoError(t, res3.Error)
+	actuatedPLR, found := m.actuatedState.GetPodLevelResources(pod.UID)
+	require.True(t, found)
+	_, hasCPUReq := actuatedPLR.Requests[v1.ResourceCPU]
+	assert.False(t, hasCPUReq, "unset CPU request key must be deleted from actuated state")
+	assert.Empty(t, actuatedPLR.Limits, "unset limit keys must be deleted from actuated state")
+
+	// Verify killPodWithSyncResult clears pendingPodResize.
+	m.pendingPodResize.Store(pod.UID, struct{}{})
+	_ = m.killPodWithSyncResult(tCtx, pod, kubecontainer.Pod{ID: pod.UID}, nil)
+	_, stillPending := m.pendingPodResize.Load(pod.UID)
+	assert.False(t, stillPending, "killPodWithSyncResult must clear pendingPodResize")
 }

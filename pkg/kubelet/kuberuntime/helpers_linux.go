@@ -46,7 +46,8 @@ func subtractOverheadFromResourceConfig(resCfg *cm.ResourceConfig, pod *v1.Pod) 
 		}
 
 		if memory, found := pod.Spec.Overhead[v1.ResourceMemory]; found {
-			if rc.Memory != nil {
+			// Unbounded cgroup memory limits are read back as -1; only subtract overhead from finite limits.
+			if rc.Memory != nil && *rc.Memory > 0 {
 				currMemory := *rc.Memory
 
 				if mem, ok := memory.AsInt64(); ok {

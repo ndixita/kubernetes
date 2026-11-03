@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"maps"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -403,22 +404,21 @@ func mergeResourceConfig(source, update *cm.ResourceConfig) *cm.ResourceConfig {
 		merged.PidsLimit = update.PidsLimit
 	}
 
+	// Clone maps so mutating merged does not corrupt source for rollback on cgroup failure.
 	if update.HugePageLimit != nil {
+		merged.HugePageLimit = maps.Clone(merged.HugePageLimit)
 		if merged.HugePageLimit == nil {
-			merged.HugePageLimit = make(map[int64]int64)
+			merged.HugePageLimit = make(map[int64]int64, len(update.HugePageLimit))
 		}
-		for k, v := range update.HugePageLimit {
-			merged.HugePageLimit[k] = v
-		}
+		maps.Copy(merged.HugePageLimit, update.HugePageLimit)
 	}
 
 	if update.Unified != nil {
+		merged.Unified = maps.Clone(merged.Unified)
 		if merged.Unified == nil {
-			merged.Unified = make(map[string]string)
+			merged.Unified = make(map[string]string, len(update.Unified))
 		}
-		for k, v := range update.Unified {
-			merged.Unified[k] = v
-		}
+		maps.Copy(merged.Unified, update.Unified)
 	}
 
 	return &merged

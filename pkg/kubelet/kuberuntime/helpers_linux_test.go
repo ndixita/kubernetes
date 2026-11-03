@@ -17,17 +17,31 @@ limitations under the License.
 package kuberuntime
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	apitest "k8s.io/cri-api/pkg/apis/testing"
 	"k8s.io/ktesting"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/kubernetes/pkg/features"
+	kubeletconfiginternal "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
+	cmtesting "k8s.io/kubernetes/pkg/kubelet/cm/testing"
+	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	"k8s.io/utils/ptr"
 )
 
@@ -562,6 +576,29 @@ func TestSubtractOverheadFromResourceConfig(t *testing.T) {
 				CPUQuota:  ptr.To[int64](20000),
 			},
 		},
+		{
+			name: "unboundedMemoryWithOverhead",
+			cfgInput: &cm.ResourceConfig{
+				Memory:    ptr.To[int64](-1),
+				CPUShares: ptr.To[uint64](306),
+				CPUPeriod: ptr.To[uint64](100000),
+				CPUQuota:  ptr.To[int64](30000),
+			},
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Overhead: v1.ResourceList{
+						v1.ResourceCPU:    podOverheadCPUMilli,
+						v1.ResourceMemory: podOverheadMemory,
+					},
+				},
+			},
+			expected: &cm.ResourceConfig{
+				Memory:    ptr.To[int64](-1),
+				CPUShares: ptr.To[uint64](203),
+				CPUPeriod: ptr.To[uint64](100000),
+				CPUQuota:  ptr.To[int64](20000),
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gotCfg := subtractOverheadFromResourceConfig(tc.cfgInput, tc.pod)
@@ -580,4 +617,113 @@ func TestSubtractOverheadFromResourceConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+type recordingSandboxRuntimeService struct {
+	*apitest.FakeRuntimeService
+	sandboxUpdateReqs []*runtimeapi.UpdatePodSandboxResourcesRequest
+}
+
+func (r *recordingSandboxRuntimeService) UpdatePodSandboxResources(ctx context.Context, req *runtimeapi.UpdatePodSandboxResourcesRequest) (*runtimeapi.UpdatePodSandboxResourcesResponse, error) {
+	r.sandboxUpdateReqs = append(r.sandboxUpdateReqs, proto.Clone(req).(*runtimeapi.UpdatePodSandboxResourcesRequest))
+	return r.FakeRuntimeService.UpdatePodSandboxResources(ctx, req)
+}
+
+func TestPodLevelResizeUnifiedRollback(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	logger := tCtx.Logger()
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.InPlacePodVerticalScaling:               true,
+		features.PodLevelResources:                       true,
+		features.InPlacePodLevelResourcesVerticalScaling: true,
+		features.MemoryQoS:                               true,
+	})
+
+	origCgroup2 := isCgroup2UnifiedMode
+	isCgroup2UnifiedMode = func() bool { return true }
+	t.Cleanup(func() { isCgroup2UnifiedMode = origCgroup2 })
+
+	fakeRuntime, _, m, err := createTestRuntimeManager(tCtx)
+	require.NoError(t, err)
+	recRuntime := &recordingSandboxRuntimeService{FakeRuntimeService: fakeRuntime}
+	m.runtimeService = recRuntime
+	m.memoryThrottlingFactor = new(0.8)
+	m.memoryReservationPolicy = kubeletconfiginternal.TieredReservationMemoryReservationPolicy
+
+	const (
+		mem100Mi = 100 * 1024 * 1024
+		mem200Mi = 200 * 1024 * 1024
+		mem300Mi = 300 * 1024 * 1024
+	)
+
+	mockCM := cmtesting.NewMockContainerManager(t)
+	mockCM.EXPECT().PodHasExclusiveCPUs(logger, mock.Anything).Return(false).Maybe()
+	mockCM.EXPECT().ContainerHasExclusiveCPUs(logger, mock.Anything, mock.Anything).Return(false).Maybe()
+	m.containerManager = mockCM
+	mockPCM := cmtesting.NewMockPodContainerManager(t)
+	mockCM.EXPECT().NewPodContainerManager().Return(mockPCM)
+
+	mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+		Memory: ptr.To[int64](mem300Mi),
+		Unified: map[string]string{
+			cm.Cgroup2MemoryLow:  "104857600",
+			cm.Cgroup2MemoryHigh: "272629760", // 260Mi before resize
+		},
+	}, nil)
+	mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+		CPUShares: new(cm.MilliCPUToShares(100)),
+		CPUQuota:  new(cm.MilliCPUToQuota(200, cm.QuotaPeriod)),
+	}, nil)
+	mockPCM.EXPECT().SetPodCgroupConfig(logger, mock.Anything, mock.Anything).Return(errors.New("cgroup write failed")).Once()
+
+	pod, kps := makeBasePodAndStatus()
+	pod.Spec.Containers = pod.Spec.Containers[:1]
+	kps.ContainerStatuses = kps.ContainerStatuses[:1]
+	_, fakeContainers := makeAndSetFakePod(tCtx, m, fakeRuntime, pod)
+	kps.ContainerStatuses[0].ID = kubecontainer.ContainerID{Type: "testRuntime", ID: fakeContainers[0].Id}
+
+	pod.Spec.Resources = &v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU:    resource.MustParse("100m"),
+			v1.ResourceMemory: *resource.NewQuantity(mem100Mi, resource.BinarySI),
+		},
+		Limits: v1.ResourceList{
+			v1.ResourceCPU:    resource.MustParse("200m"),
+			v1.ResourceMemory: *resource.NewQuantity(mem200Mi, resource.BinarySI),
+		},
+	}
+	pod.Spec.Containers[0].Resources = v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU:    resource.MustParse("100m"),
+			v1.ResourceMemory: *resource.NewQuantity(mem100Mi, resource.BinarySI),
+		},
+	}
+
+	m.runtimeHelper = &containertest.FakeRuntimeHelper{
+		PodStats: map[types.UID]*statsapi.PodStats{
+			pod.UID: {
+				Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](1024)},
+			},
+		},
+	}
+
+	res := m.doPodResizeAction(tCtx, pod, kps, podActions{
+		UpdatePodLevelResources: true,
+		SandboxID:               "sandbox-id",
+	})
+	require.Error(t, res.Error)
+
+	require.Len(t, recRuntime.sandboxUpdateReqs, 2, "expected initial UpdatePodSandboxResources and rollback call")
+	assert.Equal(t, int64(mem200Mi), recRuntime.sandboxUpdateReqs[0].Resources.MemoryLimitInBytes)
+	assert.Equal(t, map[string]string{
+		cm.Cgroup2MemoryLow:  "104857600",
+		cm.Cgroup2MemoryHigh: "188743680", // 180Mi desired
+	}, recRuntime.sandboxUpdateReqs[0].Resources.Unified)
+
+	// Rollback must restore the pre-resize Unified map, not the desired memory.high mutated onto podResources.
+	assert.Equal(t, int64(mem300Mi), recRuntime.sandboxUpdateReqs[1].Resources.MemoryLimitInBytes)
+	assert.Equal(t, map[string]string{
+		cm.Cgroup2MemoryLow:  "104857600",
+		cm.Cgroup2MemoryHigh: "272629760", // 260Mi preserved
+	}, recRuntime.sandboxUpdateReqs[1].Resources.Unified)
 }
