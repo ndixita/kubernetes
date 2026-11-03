@@ -22,7 +22,9 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	resourcehelper "k8s.io/component-helpers/resource"
 	"k8s.io/klog/v2"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
@@ -126,10 +128,78 @@ func disallowResizeForMemoryBackedVolumes(desiredPod, allocatedPod *v1.Pod, cgro
 	return false, "", ""
 }
 
-func disallowResizeForSwappableContainers(runtime kubecontainer.Runtime, desiredPod, allocatedPod *v1.Pod) (bool, string) {
+// isRuntimeSwapEnabledForPod reports whether LimitedSwap is active on the runtime.
+// kubecontainer.Runtime only exposes per-container swap behavior, which returns NoSwap even on
+// a LimitedSwap node when all containers in pod opted out (e.g. req == lim), so probe with a
+// swap-eligible Burstable spec using each container's name (preserving FakeRuntime name lookups).
+func isRuntimeSwapEnabledForPod(runtime kubecontainer.Runtime, pod *v1.Pod) bool {
+	if runtime == nil || pod == nil {
+		return false
+	}
+	probeMemReq := v1.ResourceList{v1.ResourceMemory: *resource.NewQuantity(1, resource.BinarySI)}
+	for container := range podutil.ContainerIter(&pod.Spec, podutil.InitContainers|podutil.Containers) {
+		probePod := &v1.Pod{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{{
+					Name:      container.Name,
+					Resources: v1.ResourceRequirements{Requests: probeMemReq},
+				}},
+			},
+		}
+		if runtime.GetContainerSwapBehavior(probePod, &probePod.Spec.Containers[0]) != kubetypes.NoSwap {
+			return true
+		}
+	}
+	return false
+}
+
+func podMemoryRequest(pod *v1.Pod) resource.Quantity {
+	reqs := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{
+		ExcludeOverhead:       true,
+		SkipPodLevelResources: !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources),
+	})
+	return reqs[v1.ResourceMemory]
+}
+
+func podLevelSwapRequestChanged(runtime kubecontainer.Runtime, desiredPod, allocatedPod *v1.Pod) bool {
 	if desiredPod == nil || allocatedPod == nil {
+		return false
+	}
+	desiredPLR := resourcehelper.IsPodLevelResourcesSet(desiredPod)
+	allocatedPLR := resourcehelper.IsPodLevelResourcesSet(allocatedPod)
+	if !desiredPLR && !allocatedPLR {
+		return false
+	}
+	desiredEligible, _ := cm.IsPodEligibleForSwap(desiredPod)
+	allocatedEligible, _ := cm.IsPodEligibleForSwap(allocatedPod)
+	if !desiredEligible && !allocatedEligible {
+		return false
+	}
+	// Adding or removing pod-level resources changes whether the pod cgroup owns memory.swap.max.
+	// When pod-level resources remain set on both specs, compare both the effective pod memory
+	// request (which sizes pod memory.swap.max) and explicit pod.spec.resources.requests.memory
+	// (which gates unbounded container swap even when aggregated container requests match it).
+	if desiredPLR && allocatedPLR &&
+		podMemoryRequest(desiredPod).Equal(podMemoryRequest(allocatedPod)) &&
+		desiredPod.Spec.Resources.Requests.Memory().Equal(*allocatedPod.Spec.Resources.Requests.Memory()) {
+		return false
+	}
+	return isRuntimeSwapEnabledForPod(runtime, desiredPod)
+}
+
+func disallowResizeForSwappableContainers(runtime kubecontainer.Runtime, desiredPod, allocatedPod *v1.Pod) (bool, string) {
+	if runtime == nil || desiredPod == nil || allocatedPod == nil {
 		return false, ""
 	}
+	// Pod-level memory request changes cannot recalculate pod cgroup memory.swap.max in place,
+	// even if individual containers opt out of swap or have RestartContainer resize policies.
+	// Skip when InPlacePodLevelResourcesVerticalScaling is disabled so Admit reports plr_feature_gate_off.
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources) &&
+		utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) &&
+		podLevelSwapRequestChanged(runtime, desiredPod, allocatedPod) {
+		return true, "In-place resize of pod-level memory requests with swap is not supported."
+	}
+
 	restartableMemoryResizePolicy := func(resizePolicies []v1.ContainerResizePolicy) bool {
 		for _, policy := range resizePolicies {
 			if policy.ResourceName == v1.ResourceMemory {

@@ -292,6 +292,9 @@ func (m *kubeGenericRuntimeManager) startContainer(ctx context.Context, podSandb
 		m.recordContainerEvent(ctx, pod, container, containerID, v1.EventTypeWarning, events.FailedToCreateContainer, "Error: %v", s.Message())
 		return s.Message(), ErrCreateContainer
 	}
+	if m.isLimitedSwapEnabled() {
+		m.setActuatedContainerSwap(containerID, m.GetContainerSwapBehavior(pod, container))
+	}
 	err = m.internalLifecycle.PreStartContainer(logger, pod, container, containerID)
 	if err != nil {
 		s, _ := grpcstatus.FromError(err)
@@ -427,6 +430,9 @@ func (m *kubeGenericRuntimeManager) updateContainerResources(ctx context.Context
 	}
 	err := m.runtimeService.UpdateContainerResources(ctx, containerID.ID, containerResources)
 	if err == nil {
+		if m.isLimitedSwapEnabled() {
+			m.setActuatedContainerSwap(containerID.ID, m.GetContainerSwapBehavior(pod, container))
+		}
 		err = m.setActuatedContainerResources(logger, pod, container, containerType)
 	}
 	return err
@@ -1392,7 +1398,11 @@ func (m *kubeGenericRuntimeManager) removeContainer(ctx context.Context, contain
 		}
 	}
 	// Remove the container.
-	return m.runtimeService.RemoveContainer(ctx, containerID)
+	err := m.runtimeService.RemoveContainer(ctx, containerID)
+	if err == nil {
+		m.deleteActuatedContainerSwap(containerID)
+	}
+	return err
 }
 
 // removeContainerLog removes the container log.

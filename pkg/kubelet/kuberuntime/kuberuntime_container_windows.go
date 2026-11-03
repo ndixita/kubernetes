@@ -202,3 +202,10 @@ func (m *kubeGenericRuntimeManager) isMemoryQoSEnforced() bool {
 
 func (m *kubeGenericRuntimeManager) applyPodLevelMemoryHigh(_ *v1.Pod, _ *cm.ResourceConfig) {
 }
+
+func (m *kubeGenericRuntimeManager) applyPodLevelSwapConfig(_ klog.Logger, _ *v1.Pod, _ *cm.ResourceConfig) {
+}
+
+func (m *kubeGenericRuntimeManager) isLimitedSwapEnabled() bool {
+	return false
+}

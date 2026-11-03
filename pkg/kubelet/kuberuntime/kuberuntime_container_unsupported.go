@@ -23,6 +23,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/types"
@@ -65,4 +66,11 @@ func (m *kubeGenericRuntimeManager) isMemoryQoSEnforced() bool {
 }
 
 func (m *kubeGenericRuntimeManager) applyPodLevelMemoryHigh(_ *v1.Pod, _ *cm.ResourceConfig) {
+}
+
+func (m *kubeGenericRuntimeManager) applyPodLevelSwapConfig(_ klog.Logger, _ *v1.Pod, _ *cm.ResourceConfig) {
+}
+
+func (m *kubeGenericRuntimeManager) isLimitedSwapEnabled() bool {
+	return false
 }

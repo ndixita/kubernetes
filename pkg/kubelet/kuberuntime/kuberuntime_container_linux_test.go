@@ -30,22 +30,30 @@ import (
 
 	libcontainercgroups "github.com/opencontainers/cgroups"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apimachinerytypes "k8s.io/apimachinery/pkg/types"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/featuregate"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/ktesting"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/apis/scheduling"
 	"k8s.io/kubernetes/pkg/features"
 	kubeletconfiginternal "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
+	cmtesting "k8s.io/kubernetes/pkg/kubelet/cm/testing"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	"k8s.io/kubernetes/pkg/kubelet/types"
+	kubeutil "k8s.io/kubernetes/pkg/kubelet/util"
 	"k8s.io/utils/cpuset"
 	"k8s.io/utils/ptr"
 )
@@ -3648,5 +3656,563 @@ func TestContainerMemoryHighSkippedWithPodLevelResources(t *testing.T) {
 		lcr := m.generateLinuxContainerResources(tCtx, burstablePod, &burstablePod.Spec.Containers[0], true)
 		_, ok := lcr.Unified[cm.Cgroup2MemoryHigh]
 		assert.False(t, ok, "memory.high should NOT be set when container memory req==limit, even if pod is Burstable")
+	})
+}
+
+func TestPodLevelSwapResizeActuation(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.PodLevelResources:                       true,
+		features.InPlacePodLevelResourcesVerticalScaling: true,
+	})
+
+	origIsCgroup2 := isCgroup2UnifiedMode
+	isCgroup2UnifiedMode = func() bool { return true }
+	t.Cleanup(func() { isCgroup2UnifiedMode = origIsCgroup2 })
+
+	cpu500m := resource.MustParse("500m")
+	cpu1 := resource.MustParse("1")
+	cpu2 := resource.MustParse("2")
+	mem512Mi := resource.MustParse("512Mi")
+	mem768Mi := resource.MustParse("768Mi")
+	mem1Gi := resource.MustParse("1Gi")
+	mem1536Mi := resource.MustParse("1536Mi")
+	mem2Gi := resource.MustParse("2Gi")
+	mem3Gi := resource.MustParse("3Gi")
+	mem4Gi := resource.MustParse("4Gi")
+
+	tests := []struct {
+		name               string
+		actuatedPodRes     *v1.ResourceRequirements
+		desiredPodRes      *v1.ResourceRequirements
+		initialPodSwapMax  string
+		expectedPodSwapMax string
+		expectedCtrSwapMax map[string]string
+		expectSkippedCtrs  []string
+	}{
+		{
+			name: "pod memory limit downsize to req == lim sets pod, sidecar, and swappable container memory.swap.max to 0",
+			actuatedPodRes: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem3Gi},
+				Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem4Gi},
+			},
+			desiredPodRes: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem3Gi},
+				Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem3Gi},
+			},
+			initialPodSwapMax:  "swapFor3Gi",
+			expectedPodSwapMax: "0",
+			expectedCtrSwapMax: map[string]string{
+				"sidecar": "0",
+				"foo1":    "0",
+				"foo2":    "0",
+			},
+			expectSkippedCtrs: []string{"foo3"},
+		},
+		{
+			name: "pod memory limit upsize from req == lim to req < lim restores pod, sidecar, and container LimitedSwap",
+			actuatedPodRes: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem3Gi},
+				Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem3Gi},
+			},
+			desiredPodRes: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem3Gi},
+				Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem4Gi},
+			},
+			initialPodSwapMax:  "0",
+			expectedPodSwapMax: "swapFor3Gi",
+			expectedCtrSwapMax: map[string]string{
+				"sidecar": "swapFor512Mi",
+				"foo1":    cm.Cgroup2MaxSwapLimit,
+				"foo2":    "swapFor1Gi",
+			},
+			expectSkippedCtrs: []string{"foo3"},
+		},
+		{
+			name: "pod CPU limit resize keeps unbounded container memory.swap.max at max without rewriting pod memory cgroup",
+			actuatedPodRes: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem3Gi},
+				Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem4Gi},
+			},
+			desiredPodRes: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem3Gi},
+				Limits:   v1.ResourceList{v1.ResourceCPU: cpu2, v1.ResourceMemory: mem4Gi},
+			},
+			initialPodSwapMax:  "swapFor3Gi",
+			expectedPodSwapMax: "",
+			expectedCtrSwapMax: map[string]string{
+				"sidecar": "swapFor512Mi",
+				"foo1":    cm.Cgroup2MaxSwapLimit,
+				"foo2":    "swapFor1Gi",
+				"foo3":    "0",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			logger := tCtx.Logger()
+			fakeRuntime, _, m, err := createTestRuntimeManager(tCtx)
+			require.NoError(t, err)
+			m.cpuCFSQuota = true
+			m.memorySwapBehavior = string(types.LimitedSwap)
+			m.getSwapControllerAvailable = func() bool { return true }
+			m.machineInfo.MemoryCapacity = uint64(8 * 1024 * 1024 * 1024)
+			m.machineInfo.SwapCapacity = uint64(4 * 1024 * 1024 * 1024)
+
+			swapFor := func(q resource.Quantity) string {
+				v, calcErr := cm.CalcSwapForBurstablePods(q.Value(), int64(m.machineInfo.MemoryCapacity), int64(m.machineInfo.SwapCapacity))
+				require.NoError(t, calcErr)
+				return strconv.FormatInt(v, 10)
+			}
+			resolveSwapToken := func(tok string) string {
+				switch tok {
+				case "swapFor3Gi":
+					return swapFor(mem3Gi)
+				case "swapFor2Gi":
+					return swapFor(mem2Gi)
+				case "swapFor1Gi":
+					return swapFor(mem1Gi)
+				case "swapFor512Mi":
+					return swapFor(mem512Mi)
+				default:
+					return tok
+				}
+			}
+
+			pod, kps := makeBasePodAndStatus()
+			pod.Spec.Resources = tc.actuatedPodRes.DeepCopy()
+			pod.Spec.InitContainers = []v1.Container{
+				{
+					Name:          "sidecar",
+					Image:         "busybox",
+					RestartPolicy: ptr.To(v1.ContainerRestartPolicyAlways),
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceMemory: mem512Mi},
+						Limits:   v1.ResourceList{v1.ResourceMemory: mem768Mi},
+					},
+				},
+			}
+			// sidecar: restartable init container with explicit swappable memory (512Mi req < 768Mi lim)
+			// foo1: unbounded container inheriting pod-level limits
+			// foo2: explicit swappable container (1Gi req < 1536Mi lim) whose own resources do not change
+			// foo3: explicit NoSwap container (1Gi req == 1Gi lim)
+			pod.Spec.Containers[1].Resources = v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceMemory: mem1Gi},
+				Limits:   v1.ResourceList{v1.ResourceMemory: mem1536Mi},
+			}
+			pod.Spec.Containers[2].Resources = v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceMemory: mem1Gi},
+				Limits:   v1.ResourceList{v1.ResourceMemory: mem1Gi},
+			}
+			sidecarStatus := &kubecontainer.Status{
+				Name:  "sidecar",
+				State: kubecontainer.ContainerStateRunning,
+				Hash:  kubecontainer.HashContainer(&pod.Spec.InitContainers[0]),
+			}
+			for i := range pod.Spec.Containers {
+				kps.ContainerStatuses[i].Hash = kubecontainer.HashContainer(&pod.Spec.Containers[i])
+			}
+			kps.ContainerStatuses = append([]*kubecontainer.Status{sidecarStatus}, kps.ContainerStatuses...)
+			kps.ActiveContainerStatuses = kps.ContainerStatuses
+
+			fakeSandbox, fakeContainers := makeAndSetFakePod(tCtx, m, fakeRuntime, pod)
+			kps.SandboxStatuses[0].Id = fakeSandbox.Id
+			for idx, fc := range fakeContainers {
+				kps.ContainerStatuses[idx].ID = kubecontainer.ContainerID{Type: "testRuntime", ID: fc.Id}
+			}
+
+			// Seed actuated state from actuatedPodRes (including inherited limits as setActuatedContainerResources does).
+			require.NoError(t, m.actuatedState.SetPodLevelResources(logger, pod.UID, tc.actuatedPodRes.DeepCopy()))
+			podutil.VisitContainers(&pod.Spec, podutil.InitContainers|podutil.Containers, func(c *v1.Container, cType podutil.ContainerType) bool {
+				actuatedCtrRes := *c.Resources.DeepCopy()
+				actuatedCtrRes.Limits = kubeutil.GetLimits(&kubeutil.ResourceOpts{
+					PodResources:       tc.actuatedPodRes,
+					ContainerResources: &c.Resources,
+				})
+				require.NoError(t, m.actuatedState.SetContainerResources(logger, pod.UID, c.Name, cType, actuatedCtrRes))
+				return true
+			})
+
+			pod.Spec.Resources = tc.desiredPodRes.DeepCopy()
+
+			var capturedPodMemoryRC *cm.ResourceConfig
+			mockCM := cmtesting.NewMockContainerManager(t)
+			mockCM.EXPECT().PodHasExclusiveCPUs(logger, mock.Anything).Return(false).Maybe()
+			mockCM.EXPECT().ContainerHasExclusiveCPUs(logger, mock.Anything, mock.Anything).Return(false).Maybe()
+			mockPCM := cmtesting.NewMockPodContainerManager(t)
+			mockCM.EXPECT().NewPodContainerManager().Return(mockPCM)
+			mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+				Memory: new(tc.actuatedPodRes.Limits.Memory().Value()),
+				Unified: map[string]string{
+					cm.Cgroup2MaxSwapFilename: resolveSwapToken(tc.initialPodSwapMax),
+				},
+			}, nil).Maybe()
+			mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+				CPUShares: new(cm.MilliCPUToShares(tc.actuatedPodRes.Requests.Cpu().MilliValue())),
+				CPUQuota:  new(cm.MilliCPUToQuota(tc.actuatedPodRes.Limits.Cpu().MilliValue(), cm.QuotaPeriod)),
+			}, nil).Maybe()
+			mockPCM.EXPECT().SetPodCgroupConfig(logger, mock.Anything, mock.Anything).Run(func(_ klog.Logger, _ *v1.Pod, rc *cm.ResourceConfig) {
+				if rc.Memory != nil {
+					capturedPodMemoryRC = rc
+				}
+			}).Return(nil).Maybe()
+			m.containerManager = mockCM
+
+			m.runtimeHelper = &containertest.FakeRuntimeHelper{
+				PodStats: map[apimachinerytypes.UID]*statsapi.PodStats{
+					pod.UID: {
+						Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](1024)},
+						Containers: []statsapi.ContainerStats{
+							{Name: "sidecar", Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](512)}},
+							{Name: "foo1", Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](512)}},
+							{Name: "foo2", Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](512)}},
+							{Name: "foo3", Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](512)}},
+						},
+					},
+				},
+			}
+
+			changes := m.computePodActions(tCtx, pod, kps, false)
+			res := m.doPodResizeAction(tCtx, pod, kps, changes)
+			require.NoError(t, res.Error, res.Message)
+
+			if tc.expectedPodSwapMax != "" {
+				wantPodSwap := resolveSwapToken(tc.expectedPodSwapMax)
+				require.NotNil(t, capturedPodMemoryRC, "expected SetPodCgroupConfig for memory")
+				require.Equal(t, wantPodSwap, capturedPodMemoryRC.Unified[cm.Cgroup2MaxSwapFilename])
+			} else {
+				require.Nil(t, capturedPodMemoryRC, "expected no SetPodCgroupConfig for memory on CPU-only resize")
+			}
+
+			for _, cs := range kps.ContainerStatuses {
+				fc := fakeRuntime.Containers[cs.ID.ID]
+				for _, skipped := range tc.expectSkippedCtrs {
+					if cs.Name == skipped {
+						require.Nil(t, fc.LinuxResources, "container %s should not receive needless UpdateContainerResources", cs.Name)
+					}
+				}
+				wantCtrSwap, shouldCheck := tc.expectedCtrSwapMax[cs.Name]
+				if !shouldCheck {
+					continue
+				}
+				wantCtrSwap = resolveSwapToken(wantCtrSwap)
+				require.NotNil(t, fc.LinuxResources, "container %s should have LinuxResources updated", cs.Name)
+				require.Equal(t, wantCtrSwap, fc.LinuxResources.Unified[cm.Cgroup2MaxSwapFilename], "container %s memory.swap.max", cs.Name)
+			}
+
+			// Verify idempotency: a follow-up computePodActions sees no further container updates or pod resize needed.
+			nextChanges := m.computePodActions(tCtx, pod, kps, false)
+			require.Empty(t, nextChanges.ContainersToUpdate, "resize should be idempotent on next SyncPod")
+			require.False(t, nextChanges.UpdatePodLevelResources, "pod-level resources should be marked actuated")
+		})
+	}
+
+	t.Run("adding Guaranteed pod-level resources with unchanged memory.max writes pod memory.swap.max to 0", func(t *testing.T) {
+		tCtx := ktesting.Init(t)
+		logger := tCtx.Logger()
+		fakeRuntime, _, m, err := createTestRuntimeManager(tCtx)
+		require.NoError(t, err)
+		m.cpuCFSQuota = true
+		m.memorySwapBehavior = string(types.LimitedSwap)
+		m.getSwapControllerAvailable = func() bool { return true }
+		m.machineInfo.MemoryCapacity = uint64(8 * 1024 * 1024 * 1024)
+		m.machineInfo.SwapCapacity = uint64(4 * 1024 * 1024 * 1024)
+
+		pod, kps := makeBasePodAndStatus()
+		pod.Spec.Containers = pod.Spec.Containers[:1]
+		pod.Status.ContainerStatuses = pod.Status.ContainerStatuses[:1]
+		kps.ContainerStatuses = kps.ContainerStatuses[:1]
+		pod.Spec.Containers[0].Resources = v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem2Gi},
+			Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem2Gi},
+		}
+		kps.ContainerStatuses[0].Hash = kubecontainer.HashContainer(&pod.Spec.Containers[0])
+
+		fakeSandbox, fakeContainers := makeAndSetFakePod(tCtx, m, fakeRuntime, pod)
+		kps.SandboxStatuses[0].Id = fakeSandbox.Id
+		kps.ContainerStatuses[0].ID = kubecontainer.ContainerID{Type: "testRuntime", ID: fakeContainers[0].Id}
+		require.NoError(t, m.actuatedState.SetContainerResources(logger, pod.UID, pod.Spec.Containers[0].Name, podutil.Containers, pod.Spec.Containers[0].Resources))
+
+		pod.Spec.Resources = &v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem2Gi},
+			Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem2Gi},
+		}
+
+		var capturedPodMemoryRC *cm.ResourceConfig
+		mockCM := cmtesting.NewMockContainerManager(t)
+		mockCM.EXPECT().PodHasExclusiveCPUs(logger, mock.Anything).Return(false).Maybe()
+		mockCM.EXPECT().ContainerHasExclusiveCPUs(logger, mock.Anything, mock.Anything).Return(false).Maybe()
+		mockPCM := cmtesting.NewMockPodContainerManager(t)
+		mockCM.EXPECT().NewPodContainerManager().Return(mockPCM)
+		mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+			Memory:  new(mem2Gi.Value()),
+			Unified: map[string]string{cm.Cgroup2MaxSwapFilename: cm.Cgroup2MaxSwapLimit},
+		}, nil).Maybe()
+		mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+			CPUShares: new(cm.MilliCPUToShares(cpu1.MilliValue())),
+			CPUQuota:  new(cm.MilliCPUToQuota(cpu1.MilliValue(), cm.QuotaPeriod)),
+		}, nil).Maybe()
+		mockPCM.EXPECT().SetPodCgroupConfig(logger, mock.Anything, mock.Anything).Run(func(_ klog.Logger, _ *v1.Pod, rc *cm.ResourceConfig) {
+			if rc.Memory != nil {
+				capturedPodMemoryRC = rc
+			}
+		}).Return(nil).Maybe()
+		m.containerManager = mockCM
+
+		changes := m.computePodActions(tCtx, pod, kps, false)
+		res := m.doPodResizeAction(tCtx, pod, kps, changes)
+		require.NoError(t, res.Error, res.Message)
+		require.NotNil(t, capturedPodMemoryRC, "SetPodCgroupConfig should write memory.swap.max=0 even when memory.max is unchanged")
+		require.Equal(t, "0", capturedPodMemoryRC.Unified[cm.Cgroup2MaxSwapFilename])
+	})
+
+	t.Run("CPU resize preserves absent pod memory limit and adding finite pod memory limit shrinks containers before pod cgroup", func(t *testing.T) {
+		tCtx := ktesting.Init(t)
+		logger := tCtx.Logger()
+		fakeRuntime, _, m, err := createTestRuntimeManager(tCtx)
+		require.NoError(t, err)
+		m.cpuCFSQuota = true
+		m.memorySwapBehavior = string(types.LimitedSwap)
+		m.getSwapControllerAvailable = func() bool { return true }
+		m.machineInfo.MemoryCapacity = uint64(8 * 1024 * 1024 * 1024)
+		m.machineInfo.SwapCapacity = uint64(4 * 1024 * 1024 * 1024)
+
+		swap2Gi, err := cm.CalcSwapForBurstablePods(mem2Gi.Value(), int64(m.machineInfo.MemoryCapacity), int64(m.machineInfo.SwapCapacity))
+		require.NoError(t, err)
+
+		initialPodRes := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem2Gi},
+			Limits:   v1.ResourceList{v1.ResourceCPU: cpu1},
+		}
+		pod, kps := makeBasePodAndStatus()
+		pod.Spec.Containers = pod.Spec.Containers[:1]
+		pod.Status.ContainerStatuses = pod.Status.ContainerStatuses[:1]
+		kps.ContainerStatuses = kps.ContainerStatuses[:1]
+		pod.Spec.Resources = initialPodRes.DeepCopy()
+		kps.ContainerStatuses[0].Hash = kubecontainer.HashContainer(&pod.Spec.Containers[0])
+
+		fakeSandbox, fakeContainers := makeAndSetFakePod(tCtx, m, fakeRuntime, pod)
+		kps.SandboxStatuses[0].Id = fakeSandbox.Id
+		kps.ContainerStatuses[0].ID = kubecontainer.ContainerID{Type: "testRuntime", ID: fakeContainers[0].Id}
+
+		require.NoError(t, m.actuatedState.SetPodLevelResources(logger, pod.UID, initialPodRes.DeepCopy()))
+		actuatedCtrRes := v1.ResourceRequirements{
+			Limits: kubeutil.GetLimits(&kubeutil.ResourceOpts{PodResources: initialPodRes, ContainerResources: &pod.Spec.Containers[0].Resources}),
+		}
+		require.NoError(t, m.actuatedState.SetContainerResources(logger, pod.UID, pod.Spec.Containers[0].Name, podutil.Containers, actuatedCtrRes))
+
+		podCgroupSet := false
+		var capturedPodMemoryRC *cm.ResourceConfig
+		mockCM := cmtesting.NewMockContainerManager(t)
+		mockCM.EXPECT().PodHasExclusiveCPUs(logger, mock.Anything).Return(false).Maybe()
+		mockCM.EXPECT().ContainerHasExclusiveCPUs(logger, mock.Anything, mock.Anything).Return(false).Maybe()
+		mockPCM := cmtesting.NewMockPodContainerManager(t)
+		mockCM.EXPECT().NewPodContainerManager().Return(mockPCM).Maybe()
+		mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+			Memory:  new(int64(-1)),
+			Unified: map[string]string{cm.Cgroup2MaxSwapFilename: strconv.FormatInt(swap2Gi, 10)},
+		}, nil).Maybe()
+		mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+			CPUShares: new(cm.MilliCPUToShares(cpu500m.MilliValue())),
+			CPUQuota:  new(cm.MilliCPUToQuota(cpu1.MilliValue(), cm.QuotaPeriod)),
+		}, nil).Maybe()
+		mockPCM.EXPECT().SetPodCgroupConfig(logger, mock.Anything, mock.Anything).Run(func(_ klog.Logger, _ *v1.Pod, rc *cm.ResourceConfig) {
+			if rc.Memory != nil {
+				fc := fakeRuntime.Containers[fakeContainers[0].Id]
+				require.NotNil(t, fc.LinuxResources, "container memory/swap must shrink before pod cgroup when adding finite pod memory limit")
+				require.Equal(t, "0", fc.LinuxResources.Unified[cm.Cgroup2MaxSwapFilename])
+				podCgroupSet = true
+				capturedPodMemoryRC = rc
+			}
+		}).Return(nil).Maybe()
+		m.containerManager = mockCM
+		m.runtimeHelper = &containertest.FakeRuntimeHelper{
+			PodStats: map[apimachinerytypes.UID]*statsapi.PodStats{
+				pod.UID: {
+					Memory:     &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](1024)},
+					Containers: []statsapi.ContainerStats{{Name: "foo1", Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](512)}}},
+				},
+			},
+		}
+
+		// Step 1: CPU-only resize must not populate a zero-valued memory limit in actuatedPodResources.
+		pod.Spec.Resources.Limits[v1.ResourceCPU] = cpu2
+		changes := m.computePodActions(tCtx, pod, kps, false)
+		res := m.doPodResizeAction(tCtx, pod, kps, changes)
+		require.NoError(t, res.Error, res.Message)
+		actuatedPod, ok := m.actuatedState.GetPodLevelResources(pod.UID)
+		require.True(t, ok)
+		_, hasMemLim := actuatedPod.Limits[v1.ResourceMemory]
+		require.False(t, hasMemLim, "actuatedPodResources.Limits should not record zero memory when pod memory limit is unset")
+
+		// Step 2: Add finite pod memory limit (unlimited -1 -> 2Gi == request), flipping pod & container to NoSwap.
+		fakeRuntime.Containers[fakeContainers[0].Id].LinuxResources = nil
+		pod.Spec.Resources.Limits[v1.ResourceMemory] = mem2Gi
+		changes = m.computePodActions(tCtx, pod, kps, false)
+		res = m.doPodResizeAction(tCtx, pod, kps, changes)
+		require.NoError(t, res.Error, res.Message)
+		require.True(t, podCgroupSet, "expected SetPodCgroupConfig for memory when adding finite limit")
+		require.Equal(t, mem2Gi.Value(), *capturedPodMemoryRC.Memory)
+		require.Equal(t, "0", capturedPodMemoryRC.Unified[cm.Cgroup2MaxSwapFilename])
+	})
+
+	t.Run("partial container CRI and pod cgroup failures keep resize in progress and converge on retry", func(t *testing.T) {
+		tCtx := ktesting.Init(t)
+		logger := tCtx.Logger()
+		fakeRuntime, _, m, err := createTestRuntimeManager(tCtx)
+		require.NoError(t, err)
+		m.cpuCFSQuota = true
+		m.memorySwapBehavior = string(types.LimitedSwap)
+		m.getSwapControllerAvailable = func() bool { return true }
+		m.machineInfo.MemoryCapacity = uint64(8 * 1024 * 1024 * 1024)
+		m.machineInfo.SwapCapacity = uint64(4 * 1024 * 1024 * 1024)
+
+		swap2Gi, err := cm.CalcSwapForBurstablePods(mem2Gi.Value(), int64(m.machineInfo.MemoryCapacity), int64(m.machineInfo.SwapCapacity))
+		require.NoError(t, err)
+
+		initialPodRes := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem2Gi},
+			Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem4Gi},
+		}
+		pod, kps := makeBasePodAndStatus()
+		pod.Spec.Containers = pod.Spec.Containers[:2]
+		pod.Status.ContainerStatuses = pod.Status.ContainerStatuses[:2]
+		kps.ContainerStatuses = kps.ContainerStatuses[:2]
+		pod.Spec.Resources = initialPodRes.DeepCopy()
+		// foo1: unbounded (4Gi -> 2Gi on pod limit downsize, prepended first)
+		// foo2: explicit 1Gi req / 1536Mi lim (own limits unchanged, appended second via swapBehaviorChanged)
+		pod.Spec.Containers[1].Resources = v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceMemory: mem1Gi},
+			Limits:   v1.ResourceList{v1.ResourceMemory: mem1536Mi},
+		}
+		for i := range pod.Spec.Containers {
+			kps.ContainerStatuses[i].Hash = kubecontainer.HashContainer(&pod.Spec.Containers[i])
+		}
+
+		fakeSandbox, fakeContainers := makeAndSetFakePod(tCtx, m, fakeRuntime, pod)
+		kps.SandboxStatuses[0].Id = fakeSandbox.Id
+		for idx, fc := range fakeContainers {
+			kps.ContainerStatuses[idx].ID = kubecontainer.ContainerID{Type: "testRuntime", ID: fc.Id}
+		}
+
+		require.NoError(t, m.actuatedState.SetPodLevelResources(logger, pod.UID, initialPodRes.DeepCopy()))
+		for i := range pod.Spec.Containers {
+			actuatedCtrRes := *pod.Spec.Containers[i].Resources.DeepCopy()
+			actuatedCtrRes.Limits = kubeutil.GetLimits(&kubeutil.ResourceOpts{PodResources: initialPodRes, ContainerResources: &pod.Spec.Containers[i].Resources})
+			require.NoError(t, m.actuatedState.SetContainerResources(logger, pod.UID, pod.Spec.Containers[i].Name, podutil.Containers, actuatedCtrRes))
+		}
+
+		var podCgroupErr error
+		var capturedPodMemoryRC *cm.ResourceConfig
+		mockCM := cmtesting.NewMockContainerManager(t)
+		mockCM.EXPECT().PodHasExclusiveCPUs(logger, mock.Anything).Return(false).Maybe()
+		mockCM.EXPECT().ContainerHasExclusiveCPUs(logger, mock.Anything, mock.Anything).Return(false).Maybe()
+		mockPCM := cmtesting.NewMockPodContainerManager(t)
+		mockCM.EXPECT().NewPodContainerManager().Return(mockPCM).Maybe()
+		mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceMemory).Return(&cm.ResourceConfig{
+			Memory:  new(mem4Gi.Value()),
+			Unified: map[string]string{cm.Cgroup2MaxSwapFilename: strconv.FormatInt(swap2Gi, 10)},
+		}, nil).Maybe()
+		mockPCM.EXPECT().GetPodCgroupConfig(mock.Anything, v1.ResourceCPU).Return(&cm.ResourceConfig{
+			CPUShares: new(cm.MilliCPUToShares(cpu500m.MilliValue())),
+			CPUQuota:  new(cm.MilliCPUToQuota(cpu1.MilliValue(), cm.QuotaPeriod)),
+		}, nil).Maybe()
+		mockPCM.EXPECT().SetPodCgroupConfig(logger, mock.Anything, mock.Anything).RunAndReturn(func(_ klog.Logger, _ *v1.Pod, rc *cm.ResourceConfig) error {
+			if podCgroupErr != nil {
+				return podCgroupErr
+			}
+			if rc.Memory != nil {
+				capturedPodMemoryRC = rc
+			}
+			return nil
+		}).Maybe()
+		m.containerManager = mockCM
+		m.runtimeHelper = &containertest.FakeRuntimeHelper{
+			PodStats: map[apimachinerytypes.UID]*statsapi.PodStats{
+				pod.UID: {
+					Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](1024)},
+					Containers: []statsapi.ContainerStats{
+						{Name: "foo1", Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](512)}},
+						{Name: "foo2", Memory: &statsapi.MemoryStats{UsageBytes: ptr.To[uint64](512)}},
+					},
+				},
+			},
+		}
+
+		// Downsize pod limit 4Gi -> 2Gi (req == lim).
+		pod.Spec.Resources.Limits[v1.ResourceMemory] = mem2Gi
+
+		// Attempt 1: foo1 succeeds, foo2 fails transiently in CRI.
+		savedFoo2 := fakeRuntime.Containers[fakeContainers[1].Id]
+		delete(fakeRuntime.Containers, fakeContainers[1].Id)
+		changes := m.computePodActions(tCtx, pod, kps, false)
+		res := m.doPodResizeAction(tCtx, pod, kps, changes)
+		require.Error(t, res.Error)
+		require.Equal(t, "0", fakeRuntime.Containers[fakeContainers[0].Id].LinuxResources.Unified[cm.Cgroup2MaxSwapFilename])
+		require.True(t, m.IsPodResizeInProgress(pod, kps), "resize must remain in progress after partial container CRI failure")
+
+		// Attempt 2: restore foo2 so container CRI succeeds, but inject transient SetPodCgroupConfig error.
+		fakeRuntime.Containers[fakeContainers[1].Id] = savedFoo2
+		podCgroupErr = fmt.Errorf("transient cgroup write error")
+		changes = m.computePodActions(tCtx, pod, kps, false)
+		res = m.doPodResizeAction(tCtx, pod, kps, changes)
+		require.Error(t, res.Error)
+		require.NotNil(t, savedFoo2.LinuxResources, "foo2 must still be retried and updated to 0")
+		require.Equal(t, "0", savedFoo2.LinuxResources.Unified[cm.Cgroup2MaxSwapFilename])
+		require.True(t, m.IsPodResizeInProgress(pod, kps), "resize must remain in progress while pod cgroup write failed")
+
+		// Attempt 3: clear SetPodCgroupConfig error; retry converges pod cgroup and clears pendingPodResize.
+		podCgroupErr = nil
+		changes = m.computePodActions(tCtx, pod, kps, false)
+		require.True(t, changes.UpdatePodLevelResources || changes.UpdatePodResources, "pending pod cgroup resize must be retried")
+		res = m.doPodResizeAction(tCtx, pod, kps, changes)
+		require.NoError(t, res.Error, res.Message)
+		require.NotNil(t, capturedPodMemoryRC)
+		require.Equal(t, "0", capturedPodMemoryRC.Unified[cm.Cgroup2MaxSwapFilename])
+		require.False(t, m.IsPodResizeInProgress(pod, kps), "resize should no longer be in progress once pod and containers converge")
+	})
+
+	t.Run("pod-level swap resize actuation is skipped when InPlacePodLevelResourcesVerticalScaling is disabled", func(t *testing.T) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodLevelResourcesVerticalScaling, false)
+
+		tCtx := ktesting.Init(t)
+		logger := tCtx.Logger()
+		fakeRuntime, _, m, err := createTestRuntimeManager(tCtx)
+		require.NoError(t, err)
+		m.memorySwapBehavior = string(types.LimitedSwap)
+		m.getSwapControllerAvailable = func() bool { return true }
+		m.machineInfo.MemoryCapacity = uint64(8 * 1024 * 1024 * 1024)
+		m.machineInfo.SwapCapacity = uint64(4 * 1024 * 1024 * 1024)
+
+		initialPodRes := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem2Gi},
+			Limits:   v1.ResourceList{v1.ResourceCPU: cpu1, v1.ResourceMemory: mem4Gi},
+		}
+		pod, kps := makeBasePodAndStatus()
+		pod.Spec.Containers = pod.Spec.Containers[:1]
+		kps.ContainerStatuses = kps.ContainerStatuses[:1]
+		pod.Spec.Resources = initialPodRes.DeepCopy()
+		pod.Spec.Containers[0].Resources = v1.ResourceRequirements{
+			Requests: v1.ResourceList{v1.ResourceMemory: mem1Gi},
+			Limits:   v1.ResourceList{v1.ResourceMemory: mem1536Mi},
+		}
+		kps.ContainerStatuses[0].Hash = kubecontainer.HashContainer(&pod.Spec.Containers[0])
+
+		fakeSandbox, fakeContainers := makeAndSetFakePod(tCtx, m, fakeRuntime, pod)
+		kps.SandboxStatuses[0].Id = fakeSandbox.Id
+		kps.ContainerStatuses[0].ID = kubecontainer.ContainerID{Type: "testRuntime", ID: fakeContainers[0].Id}
+
+		require.NoError(t, m.actuatedState.SetPodLevelResources(logger, pod.UID, initialPodRes.DeepCopy()))
+		require.NoError(t, m.actuatedState.SetContainerResources(logger, pod.UID, pod.Spec.Containers[0].Name, podutil.Containers, pod.Spec.Containers[0].Resources))
+		m.setActuatedContainerSwap(fakeContainers[0].Id, types.LimitedSwap)
+
+		// Mutate pod.Spec.Resources to req == lim while InPlacePodLevelResourcesVerticalScaling is disabled.
+		pod.Spec.Resources.Limits[v1.ResourceMemory] = mem2Gi
+
+		changes := m.computePodActions(tCtx, pod, kps, false)
+		assert.Empty(t, changes.ContainersToUpdate)
+		assert.False(t, changes.UpdatePodLevelResources)
+		assert.False(t, m.IsPodResizeInProgress(pod, kps))
 	})
 }

@@ -134,7 +134,16 @@ func (c *cgroupV2impl) getCgroupCPUConfig(cgroupPath string) (*ResourceConfig, e
 }
 
 func (c *cgroupV2impl) getCgroupMemoryConfig(cgroupPath string) (*ResourceConfig, error) {
-	return readCgroupMemoryConfig(cgroupPath, cgroupv2MemLimitFile)
+	rc, err := readCgroupMemoryConfig(cgroupPath, cgroupv2MemLimitFile)
+	if err != nil {
+		return nil, err
+	}
+	if swapMax, err := fscommon.GetCgroupParamString(cgroupPath, Cgroup2MaxSwapFilename); err == nil {
+		rc.Unified = map[string]string{
+			Cgroup2MaxSwapFilename: swapMax,
+		}
+	}
+	return rc, nil
 }
 
 // getSupportedUnifiedControllers returns a set of supported controllers when running on cgroup v2

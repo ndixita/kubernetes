@@ -20,6 +20,7 @@ import (
 	"context"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -27,6 +28,7 @@ import (
 	internalapi "k8s.io/cri-api/pkg/apis"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
@@ -52,6 +54,22 @@ func isBurstableNonCriticalPod(pod *v1.Pod) bool {
 
 func isMemoryRangeEligibleForSwap(memRequest, memLimit int64) bool {
 	return memRequest > 0 && memRequest != memLimit
+}
+
+// containerSpecMemoryLimit returns the container's own memory limit, ignoring pod-level
+// limits synthesized onto container copies during in-place resize.
+func containerSpecMemoryLimit(pod *v1.Pod, container *v1.Container) *resource.Quantity {
+	if pod != nil {
+		for c := range podutil.ContainerIter(&pod.Spec, podutil.InitContainers|podutil.Containers) {
+			if c.Name == container.Name {
+				if c.Resources.Limits.Memory().IsZero() {
+					return c.Resources.Limits.Memory()
+				}
+				break
+			}
+		}
+	}
+	return container.Resources.Limits.Memory()
 }
 
 // IsPodEligibleForSwap reports whether the pod is eligible for swap under LimitedSwap
@@ -99,7 +117,7 @@ func IsContainerEligibleForSwap(pod *v1.Pod, container *v1.Container) bool {
 	}
 
 	memReq := container.Resources.Requests.Memory().Value()
-	memLimit := container.Resources.Limits.Memory().Value()
+	memLimit := containerSpecMemoryLimit(pod, container).Value()
 	if memReq == 0 && memLimit == 0 {
 		return plrActive && !pod.Spec.Resources.Requests.Memory().IsZero()
 	}

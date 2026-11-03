@@ -40,6 +40,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apitypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/types"
@@ -757,6 +758,121 @@ var _ = SIGDescribe("Swap", "[LinuxOnly]", ginkgo.Ordered, feature.Swap, framewo
 					}, 5*time.Minute, 1*time.Second).Should(gomega.Succeed())
 
 					framework.ExpectNoError(podClient.Delete(context.Background(), stressPod.Name, metav1.DeleteOptions{}))
+				})
+
+				f.Context("with InPlacePodLevelResourcesVerticalScaling", framework.WithFeatureGate(features.InPlacePodLevelResourcesVerticalScaling), func() {
+					ginkgo.It("updates pod and container memory.swap.max on pod-level memory limit resize and rejects pod-level memory request resize", func(ctx context.Context) {
+						mem64Mi := resource.MustParse("64Mi")
+						mem128Mi := resource.MustParse("128Mi")
+						mem256Mi := resource.MustParse("256Mi")
+
+						pod := getPodLevelSwapTestPod(f.Namespace.Name,
+							&v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse("100m"),
+									v1.ResourceMemory: mem128Mi,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse("200m"),
+									v1.ResourceMemory: mem256Mi,
+								},
+							},
+							nil,
+							[]v1.Container{
+								newSleepingContainer("c1", v1.ResourceRequirements{
+									Requests: v1.ResourceList{v1.ResourceMemory: mem64Mi},
+									Limits:   v1.ResourceList{v1.ResourceMemory: mem128Mi},
+								}),
+								newSleepingContainer("c2", v1.ResourceRequirements{}),
+							},
+						)
+						pod = runPodAndWaitUntilScheduled(f, pod)
+						if !isPodCgroupV2(f, pod) {
+							e2eskipper.Skipf("swap tests require cgroup v2")
+						}
+						if getSwapCapacity(f, pod).IsZero() {
+							e2eskipper.Skipf("swap is not provisioned on the node")
+						}
+
+						expectedPodSwap := calcSwapForMemoryRequest(f, pod, mem128Mi.Value())
+						expectedC1Swap := calcSwapForMemoryRequest(f, pod, mem64Mi.Value())
+						expectPodCgroupLimitedSwap(pod, expectedPodSwap)
+						expectContainerLimitedSwap(f, pod, "c1", expectedC1Swap)
+						expectContainerMaxSwap(f, pod, "c2")
+
+						ginkgo.By("Downsizing pod-level memory limit to match request (128Mi) so pod and containers flip to NoSwap")
+						downsizePatch := []byte(`{"spec":{"resources":{"limits":{"memory":"128Mi"}}}}`)
+						_, err := f.ClientSet.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, apitypes.StrategicMergePatchType, downsizePatch, metav1.PatchOptions{}, "resize")
+						framework.ExpectNoError(err)
+
+						gomega.Eventually(ctx, func(ctx context.Context) error {
+							updated, getErr := f.ClientSet.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+							if getErr != nil {
+								return getErr
+							}
+							if updated.Status.Resources == nil || updated.Status.Resources.Limits.Memory().Cmp(mem128Mi) != 0 {
+								return fmt.Errorf("waiting for pod.status.resources.limits.memory=128Mi, got %+v", updated.Status.Resources)
+							}
+							if got := readPodCgroupSwapMax(updated); got != "0" {
+								return fmt.Errorf("expected pod cgroup memory.swap.max=0, got %s", got)
+							}
+							for _, ctrName := range []string{"c1", "c2"} {
+								gotCtr, cErr := readContainerCgroupFile(f, updated, ctrName, cgroupV2SwapLimitFile)
+								if cErr != nil {
+									return cErr
+								}
+								if gotCtr != "0" {
+									return fmt.Errorf("expected container %s memory.swap.max=0, got %s", ctrName, gotCtr)
+								}
+							}
+							pod = updated
+							return nil
+						}, f.Timeouts.PodStart, time.Second).Should(gomega.Succeed())
+						for _, cs := range pod.Status.ContainerStatuses {
+							gomega.Expect(cs.RestartCount).To(gomega.BeZero(), "container %s should resize in place without restarting", cs.Name)
+						}
+
+						ginkgo.By("Upsizing pod-level memory limit back to 256Mi so pod and containers restore LimitedSwap")
+						upsizePatch := []byte(`{"spec":{"resources":{"limits":{"memory":"256Mi"}}}}`)
+						_, err = f.ClientSet.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, apitypes.StrategicMergePatchType, upsizePatch, metav1.PatchOptions{}, "resize")
+						framework.ExpectNoError(err)
+
+						gomega.Eventually(ctx, func(ctx context.Context) error {
+							updated, getErr := f.ClientSet.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+							if getErr != nil {
+								return getErr
+							}
+							if updated.Status.Resources == nil || updated.Status.Resources.Limits.Memory().Cmp(mem256Mi) != 0 {
+								return fmt.Errorf("waiting for pod.status.resources.limits.memory=256Mi, got %+v", updated.Status.Resources)
+							}
+							pod = updated
+							return nil
+						}, f.Timeouts.PodStart, time.Second).Should(gomega.Succeed())
+						expectPodCgroupLimitedSwap(pod, expectedPodSwap)
+						expectContainerLimitedSwap(f, pod, "c1", expectedC1Swap)
+						expectContainerMaxSwap(f, pod, "c2")
+						for _, cs := range pod.Status.ContainerStatuses {
+							gomega.Expect(cs.RestartCount).To(gomega.BeZero(), "container %s should resize in place without restarting", cs.Name)
+						}
+
+						ginkgo.By("Rejecting pod-level memory request resize as Infeasible while swap is active")
+						reqPatch := []byte(`{"spec":{"resources":{"requests":{"memory":"192Mi"}}}}`)
+						_, err = f.ClientSet.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, apitypes.StrategicMergePatchType, reqPatch, metav1.PatchOptions{}, "resize")
+						framework.ExpectNoError(err)
+
+						gomega.Eventually(ctx, func(ctx context.Context) error {
+							updated, getErr := f.ClientSet.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+							if getErr != nil {
+								return getErr
+							}
+							for _, cond := range updated.Status.Conditions {
+								if cond.Type == v1.PodResizePending && cond.Status == v1.ConditionTrue && cond.Reason == v1.PodReasonInfeasible {
+									return nil
+								}
+							}
+							return fmt.Errorf("waiting for PodResizePending=Infeasible condition, got %+v", updated.Status.Conditions)
+						}, f.Timeouts.PodStart, time.Second).Should(gomega.Succeed())
+					})
 				})
 			})
 		})

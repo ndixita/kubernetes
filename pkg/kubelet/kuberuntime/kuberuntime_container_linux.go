@@ -532,6 +532,16 @@ func (m *kubeGenericRuntimeManager) isLimitedSwapEnabled() bool {
 		isCgroup2UnifiedMode()
 }
 
+func (m *kubeGenericRuntimeManager) applyPodLevelSwapConfig(logger klog.Logger, pod *v1.Pod, rc *cm.ResourceConfig) {
+	var memCapacity, swapCapacity int64
+	if m.machineInfo != nil {
+		memCapacity = int64(m.machineInfo.MemoryCapacity)
+		swapCapacity = int64(m.machineInfo.SwapCapacity)
+	}
+	swapControllerAvailable := m.getSwapControllerAvailable != nil && m.getSwapControllerAvailable()
+	cm.ApplyPodLevelSwapConfig(logger, pod, rc, m.memorySwapBehavior, memCapacity, swapCapacity, isCgroup2UnifiedMode(), swapControllerAvailable)
+}
+
 // initSwapControllerAvailabilityCheck returns a function that checks swap controller availability
 // with lazy initialization using sync.OnceValue
 func initSwapControllerAvailabilityCheck(ctx context.Context) func() bool {
