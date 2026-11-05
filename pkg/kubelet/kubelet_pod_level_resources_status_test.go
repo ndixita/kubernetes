@@ -1,5 +1,3 @@
-//go:build linux
-
 /*
 Copyright The Kubernetes Authors.
 
@@ -19,6 +17,7 @@ limitations under the License.
 package kubelet
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -34,6 +33,9 @@ import (
 )
 
 func TestConvertToAPIPodLevelResourcesStatus(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("InPlacePodLevelResourcesVerticalScaling cgroup resource reporting is only supported on Linux")
+	}
 	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 		features.PodLevelResources:                       true,
 		features.InPlacePodLevelResourcesVerticalScaling: true,
@@ -106,4 +108,57 @@ func TestConvertToAPIPodLevelResourcesStatus(t *testing.T) {
 			require.Equal(t, tc.expectedMilliCPU, got.Requests.Cpu().MilliValue())
 		})
 	}
+}
+
+func TestConvertToAPIPodLevelResourcesStatusNonLinux(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.PodLevelResources:                       true,
+		features.InPlacePodLevelResourcesVerticalScaling: true,
+	})
+
+	origGOOS := goos
+	goos = "windows"
+	t.Cleanup(func() {
+		goos = origGOOS
+	})
+
+	logger, _ := ktesting.NewTestContext(t)
+	pod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name: "c1",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("100m"),
+							v1.ResourceMemory: resource.MustParse("100Mi"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("200m"),
+							v1.ResourceMemory: resource.MustParse("200Mi"),
+						},
+					},
+				},
+			},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning},
+	}
+
+	// mockCM has no expectations configured, so any call to NewPodContainerManager
+	// or GetPodCgroupConfig will fail the test.
+	mockCM := cmtesting.NewMockContainerManager(t)
+	kl := &Kubelet{containerManager: mockCM}
+
+	got := kl.convertToAPIPodLevelResourcesStatus(logger, pod, v1.PodStatus{})
+	expected := &v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceCPU:    resource.MustParse("100m"),
+			v1.ResourceMemory: resource.MustParse("100Mi"),
+		},
+		Limits: v1.ResourceList{
+			v1.ResourceCPU:    resource.MustParse("200m"),
+			v1.ResourceMemory: resource.MustParse("200Mi"),
+		},
+	}
+	require.Equal(t, expected, got)
 }

@@ -2244,7 +2244,7 @@ func getEffectiveAllocatedResources(allocatedPod *v1.Pod) *v1.ResourceRequiremen
 }
 
 func (kl *Kubelet) convertToAPIPodLevelResourcesStatus(logger klog.Logger, allocatedPod *v1.Pod, oldPodStatus v1.PodStatus) *v1.ResourceRequirements {
-	if allocatedPod.Status.Phase != v1.PodRunning {
+	if goos != "linux" || allocatedPod.Status.Phase != v1.PodRunning {
 		return getEffectiveAllocatedResources(allocatedPod)
 	}
 
@@ -2260,8 +2260,7 @@ func (kl *Kubelet) convertToAPIPodLevelResourcesStatus(logger klog.Logger, alloc
 	memoryLimit := cm.MemoryLimitsFromConfig(memoryConfig)
 	cpuConfig, err := pcm.GetPodCgroupConfig(allocatedPod, v1.ResourceCPU)
 	if err != nil {
-		logger.Error(err, "failed to read memory cgroup limits for the pod", "podName", allocatedPod.Name)
-
+		logger.Error(err, "failed to read cpu cgroup config for the pod", "podName", allocatedPod.Name)
 	}
 
 	cpuRequest := cm.CPURequestsFromConfig(cpuConfig)
