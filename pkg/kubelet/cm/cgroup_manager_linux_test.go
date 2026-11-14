@@ -461,9 +461,10 @@ func TestCgroupManagerGetCgroupConfig(t *testing.T) {
 		setupFilesV1 func(t *testing.T, podDir string)
 		setupFilesV2 func(t *testing.T, podDir string)
 
-		expectErr   bool
-		mountPoints map[string]string
-		expectedCfg *ResourceConfig
+		expectErr      bool
+		expectNotExist bool
+		mountPoints    map[string]string
+		expectedCfg    *ResourceConfig
 	}{
 		{
 			name:     "valid CPU quota, period, and shares",
@@ -559,6 +560,18 @@ func TestCgroupManagerGetCgroupConfig(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			name:           "missing memory limit file wraps ENOENT",
+			resource:       v1.ResourceMemory,
+			expectErr:      true,
+			expectNotExist: true,
+		},
+		{
+			name:           "missing CPU files wrap ENOENT",
+			resource:       v1.ResourceCPU,
+			expectErr:      true,
+			expectNotExist: true,
+		},
+		{
 			name:     "malformed cpu.max invalid period integer returns error under v2",
 			resource: v1.ResourceCPU,
 			setupFilesV2: func(t *testing.T, podDir string) {
@@ -610,6 +623,9 @@ func TestCgroupManagerGetCgroupConfig(t *testing.T) {
 					cfg, err := m.GetCgroupConfig(cgroupName, tc.resource)
 					if tc.expectErr {
 						require.Errorf(t, err, "expected error for %s in %s", tc.name, runner.version)
+						if tc.expectNotExist {
+							require.ErrorIsf(t, err, os.ErrNotExist, "expected ENOENT for %s in %s", tc.name, runner.version)
+						}
 					} else {
 						require.NoErrorf(t, err, "unexpected error for %s in %s", tc.name, runner.version)
 						assert.Equalf(t, tc.expectedCfg, cfg, "mismatch for %s in %s", tc.name, runner.version)

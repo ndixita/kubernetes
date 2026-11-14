@@ -19,16 +19,20 @@ limitations under the License.
 package kubelet
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	v1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/ktesting"
+	"k8s.io/ktesting/initoption"
 	"k8s.io/kubernetes/pkg/features"
 	cm "k8s.io/kubernetes/pkg/kubelet/cm"
 	cmtesting "k8s.io/kubernetes/pkg/kubelet/cm/testing"
@@ -95,7 +99,6 @@ func TestConvertToAPIPodLevelResourcesStatus(t *testing.T) {
 			}
 
 			mockPCM := cmtesting.NewMockPodContainerManager(t)
-			mockPCM.EXPECT().Exists(pod).Return(true)
 			mockPCM.EXPECT().GetPodCgroupConfig(pod, v1.ResourceMemory).Return(nil, nil)
 			mockPCM.EXPECT().GetPodCgroupConfig(pod, v1.ResourceCPU).Return(cpuCfg, nil)
 
@@ -103,7 +106,7 @@ func TestConvertToAPIPodLevelResourcesStatus(t *testing.T) {
 			mockCM.EXPECT().NewPodContainerManager().Return(mockPCM)
 
 			kl := &Kubelet{containerManager: mockCM}
-			got := kl.convertToAPIPodLevelResourcesStatus(logger, pod, v1.PodStatus{})
+			got := kl.convertToAPIPodLevelResourcesStatus(logger, pod, v1.PodStatus{}, false)
 			require.NotNil(t, got)
 			require.Equal(t, tc.expectedMilliCPU, got.Requests.Cpu().MilliValue())
 		})
@@ -116,60 +119,108 @@ func TestConvertToAPIPodLevelResourcesStatusMissingCgroup(t *testing.T) {
 		features.InPlacePodLevelResourcesVerticalScaling: true,
 	})
 
-	runningPod := func() *v1.Pod {
-		return &v1.Pod{
-			Spec: v1.PodSpec{
-				Resources: &v1.ResourceRequirements{
-					Requests: v1.ResourceList{
-						v1.ResourceCPU:    resource.MustParse("50m"),
-						v1.ResourceMemory: resource.MustParse("50Mi"),
-					},
-					Limits: v1.ResourceList{
-						v1.ResourceCPU:    resource.MustParse("100m"),
-						v1.ResourceMemory: resource.MustParse("100Mi"),
-					},
-				},
-				Containers: []v1.Container{{Name: "pause"}},
+	resources := func(reqCPU, reqMem, limCPU, limMem string) *v1.ResourceRequirements {
+		return &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse(reqCPU),
+				v1.ResourceMemory: resource.MustParse(reqMem),
 			},
-			Status: v1.PodStatus{Phase: v1.PodRunning},
+			Limits: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse(limCPU),
+				v1.ResourceMemory: resource.MustParse(limMem),
+			},
 		}
 	}
+	podLevelPod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Resources:  resources("50m", "50Mi", "100m", "100Mi"),
+			Containers: []v1.Container{{Name: "pause"}},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning},
+	}
+	containerOnlyPod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{Name: "c1", Resources: *resources("50m", "50Mi", "100m", "100Mi")},
+				{Name: "c2", Resources: *resources("25m", "25Mi", "50m", "50Mi")},
+			},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning},
+	}
+	// Last values read from the cgroup while the pod was running.
+	runningOldStatus := v1.PodStatus{
+		Phase:     v1.PodRunning,
+		Resources: resources("75m", "50Mi", "150m", "150Mi"),
+	}
+	enoent := fmt.Errorf("failed to read memory.max for cgroup /kubepods/podx: %w",
+		&os.PathError{Op: "openat2", Path: "/sys/fs/cgroup/kubepods/podx/memory.max", Err: os.ErrNotExist})
 
-	t.Run("skip cgroup read when pod cgroup is gone", func(t *testing.T) {
-		logger, _ := ktesting.NewTestContext(t)
-		pod := runningPod()
+	testCases := []struct {
+		name          string
+		pod           *v1.Pod
+		oldStatus     v1.PodStatus
+		podIsTerminal bool
+		// readErr is returned by both cgroup reads; nil means no read is expected.
+		readErr     error
+		expected    *v1.ResourceRequirements
+		expectError bool
+	}{
+		{
+			name:          "terminal pod reports allocated resources without reading cgroups",
+			pod:           podLevelPod,
+			oldStatus:     runningOldStatus,
+			podIsTerminal: true,
+			expected:      resources("50m", "50Mi", "100m", "100Mi"),
+		},
+		{
+			name:          "terminal container-only pod reports aggregated container resources",
+			pod:           containerOnlyPod,
+			oldStatus:     runningOldStatus,
+			podIsTerminal: true,
+			expected:      resources("75m", "75Mi", "150m", "150Mi"),
+		},
+		{
+			name:      "wrapped ENOENT on a running pod is not logged as an error",
+			pod:       podLevelPod,
+			oldStatus: runningOldStatus,
+			readErr:   enoent,
+			expected:  resources("75m", "50Mi", "150m", "150Mi"),
+		},
+		{
+			name:        "other read errors are logged as errors",
+			pod:         podLevelPod,
+			readErr:     errors.New("permission denied"),
+			expected:    resources("50m", "50Mi", "100m", "100Mi"),
+			expectError: true,
+		},
+	}
 
-		mockPCM := cmtesting.NewMockPodContainerManager(t)
-		mockPCM.EXPECT().Exists(pod).Return(false)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t, initoption.BufferLogs(true))
+			logger := tCtx.Logger()
 
-		mockCM := cmtesting.NewMockContainerManager(t)
-		mockCM.EXPECT().NewPodContainerManager().Return(mockPCM)
+			mockCM := cmtesting.NewMockContainerManager(t)
+			if tc.readErr != nil {
+				mockPCM := cmtesting.NewMockPodContainerManager(t)
+				mockPCM.EXPECT().GetPodCgroupConfig(tc.pod, v1.ResourceMemory).Return(nil, tc.readErr)
+				mockPCM.EXPECT().GetPodCgroupConfig(tc.pod, v1.ResourceCPU).Return(nil, tc.readErr)
+				mockCM.EXPECT().NewPodContainerManager().Return(mockPCM)
+			}
 
-		kl := &Kubelet{containerManager: mockCM}
-		got := kl.convertToAPIPodLevelResourcesStatus(logger, pod, v1.PodStatus{})
-		require.NotNil(t, got)
-		require.Equal(t, int64(50), got.Requests.Cpu().MilliValue())
-		require.Equal(t, resource.MustParse("50Mi"), got.Requests[v1.ResourceMemory])
-		require.Equal(t, int64(100), got.Limits.Cpu().MilliValue())
-		require.Equal(t, resource.MustParse("100Mi"), got.Limits[v1.ResourceMemory])
-	})
+			kl := &Kubelet{containerManager: mockCM}
+			got := kl.convertToAPIPodLevelResourcesStatus(logger, tc.pod, tc.oldStatus, tc.podIsTerminal)
+			require.Truef(t, apiequality.Semantic.DeepEqual(tc.expected, got), "expected %v, got %v", tc.expected, got)
 
-	t.Run("ENOENT from cgroup read is not fatal", func(t *testing.T) {
-		logger, _ := ktesting.NewTestContext(t)
-		pod := runningPod()
-
-		mockPCM := cmtesting.NewMockPodContainerManager(t)
-		mockPCM.EXPECT().Exists(pod).Return(true)
-		mockPCM.EXPECT().GetPodCgroupConfig(pod, v1.ResourceMemory).Return(nil, os.ErrNotExist)
-		mockPCM.EXPECT().GetPodCgroupConfig(pod, v1.ResourceCPU).Return(nil, os.ErrNotExist)
-
-		mockCM := cmtesting.NewMockContainerManager(t)
-		mockCM.EXPECT().NewPodContainerManager().Return(mockPCM)
-
-		kl := &Kubelet{containerManager: mockCM}
-		got := kl.convertToAPIPodLevelResourcesStatus(logger, pod, v1.PodStatus{})
-		require.NotNil(t, got)
-		require.Equal(t, int64(50), got.Requests.Cpu().MilliValue())
-		require.Equal(t, resource.MustParse("100Mi"), got.Limits[v1.ResourceMemory])
-	})
+			underlier, ok := logger.GetSink().(ktesting.Underlier)
+			require.True(t, ok)
+			logs := underlier.GetBuffer().String()
+			if tc.expectError {
+				require.Contains(t, logs, "ERROR failed to read memory cgroup config for the pod")
+				require.Contains(t, logs, "ERROR failed to read cpu cgroup config for the pod")
+			} else {
+				require.NotContains(t, logs, "ERROR")
+			}
+		})
+	}
 }
