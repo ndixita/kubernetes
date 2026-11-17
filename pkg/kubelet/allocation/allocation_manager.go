@@ -254,9 +254,7 @@ func (m *manager) retryPendingAllocations(ctx context.Context, trigger string) [
 			continue
 		}
 
-		isDeferred := m.statusManager.IsPodResizeDeferred(uid)
-
-		result, allocated, err := m.handlePendingAllocation(ctx, pod)
+		result, allocated, err := m.handlePendingAllocation(ctx, pod, trigger)
 		switch {
 		case err != nil:
 			logger.Error(err, "Failed to handle pending pod allocation", "pod", klog.KObj(pod))
@@ -269,9 +267,6 @@ func (m *manager) retryPendingAllocations(ctx context.Context, trigger string) [
 		default:
 			logger.V(4).Info("Pod allocation successfully updated", "pod", klog.KObj(pod))
 			successfulAllocations = append(successfulAllocations, pod)
-			if isDeferred {
-				metrics.PodDeferredAcceptedResizes.WithLabelValues(trigger).Inc()
-			}
 		}
 
 		// If the pod resize status has changed or SchedulerEvaluationCompleted needs to be cleared,
@@ -577,8 +572,8 @@ func (m *manager) RemoveOrphanedPods(remainingPods sets.Set[types.UID]) {
 
 // handlePendingAllocation tries to allocate the pending changes of the pod. It returns the admission
 // result of the changes, which admits the pod if no changes remain pending, and whether the
-// allocation was updated.
-func (m *manager) handlePendingAllocation(ctx context.Context, pod *v1.Pod) (lifecycle.PodAdmitResult, bool, error) {
+// allocation was updated. trigger is what caused the pending changes to be evaluated.
+func (m *manager) handlePendingAllocation(ctx context.Context, pod *v1.Pod, trigger string) (lifecycle.PodAdmitResult, bool, error) {
 	logger := klog.FromContext(ctx)
 	allocatedPod, updated := m.UpdatePodFromAllocation(pod)
 	if !updated {
@@ -614,7 +609,9 @@ func (m *manager) handlePendingAllocation(ctx context.Context, pod *v1.Pod) (lif
 			// Any resize that was pending has been reverted, even if other changes were allocated.
 			resolution = metrics.DeferredResizeResolutionReverted
 		}
-		m.statusManager.ClearPodResizePendingCondition(pod.UID, resolution)
+		if m.statusManager.ClearPodResizePendingCondition(pod.UID, resolution) && resolution == metrics.DeferredResizeResolutionAccepted {
+			metrics.PodDeferredAcceptedResizes.WithLabelValues(trigger).Inc()
+		}
 
 		if resizeRequested {
 			// Clear any errors that may have been surfaced from a previous resize and update the

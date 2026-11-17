@@ -4119,3 +4119,44 @@ func TestSyncPodDropsRemovedContainerStatus(t *testing.T) {
 	}
 	assert.Equal(t, []string{"main"}, names)
 }
+
+func TestPendingResizeMetricUpdatesOnReasonChange(t *testing.T) {
+	metrics.Register()
+
+	manager := newTestManager(&fake.Clientset{})
+	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod", UID: "test-pod"}}
+	manager.podManager.(mutablePodManager).AddPod(pod)
+
+	help := `
+		# HELP kubelet_pod_pending_resizes [ALPHA] Number of pending resizes for pods. Label 'priority_bucket' classifies the pod priority (system-critical: >=2000000000, high: 100000..1999999999, medium: 1..99999, normal: 0/default, low: -999..-1, very-low: <=-1000, unknown: nil pod). Label 'reason' describes the state (deferred, infeasible).
+		# TYPE kubelet_pod_pending_resizes gauge
+	`
+
+	require.True(t, manager.SetPodResizePendingCondition(pod.UID, v1.PodReasonDeferred, "insufficient cpu", 1))
+	require.NoError(t, testutil.GatherAndCompare(
+		legacyregistry.DefaultGatherer,
+		strings.NewReader(help+`kubelet_pod_pending_resizes{priority_bucket="normal",reason="deferred"} 1`+"\n"),
+		"kubelet_pod_pending_resizes",
+	))
+
+	require.True(t, manager.SetPodResizePendingCondition(pod.UID, v1.PodReasonInfeasible, "exceeds node allocatable", 2))
+	require.NoError(t, testutil.GatherAndCompare(
+		legacyregistry.DefaultGatherer,
+		strings.NewReader(help+`kubelet_pod_pending_resizes{priority_bucket="normal",reason="infeasible"} 1`+"\n"),
+		"kubelet_pod_pending_resizes",
+	))
+
+	require.True(t, manager.SetPodResizePendingCondition(pod.UID, v1.PodReasonDeferred, "insufficient cpu", 3))
+	require.NoError(t, testutil.GatherAndCompare(
+		legacyregistry.DefaultGatherer,
+		strings.NewReader(help+`kubelet_pod_pending_resizes{priority_bucket="normal",reason="deferred"} 1`+"\n"),
+		"kubelet_pod_pending_resizes",
+	))
+
+	require.True(t, manager.ClearPodResizePendingCondition(pod.UID, metrics.DeferredResizeResolutionReverted))
+	require.NoError(t, testutil.GatherAndCompare(
+		legacyregistry.DefaultGatherer,
+		strings.NewReader(""),
+		"kubelet_pod_pending_resizes",
+	))
+}

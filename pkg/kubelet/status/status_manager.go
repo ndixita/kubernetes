@@ -197,8 +197,9 @@ type Manager interface {
 	// the observedGeneration of the condition.
 	SetPodResizeInProgressCondition(podUID types.UID, reason, message string, observedGeneration int64) (int64, bool)
 
-	// ClearPodResizePendingCondition clears the PodResizePending condition for the pod from the cache.
-	ClearPodResizePendingCondition(podUID types.UID, resolution metrics.DeferredResizeResolution)
+	// ClearPodResizePendingCondition clears the PodResizePending condition for the pod from the cache,
+	// and reports whether the cleared condition had reason Deferred.
+	ClearPodResizePendingCondition(podUID types.UID, resolution metrics.DeferredResizeResolution) bool
 
 	// ClearPodResizeInProgressCondition clears the PodResizeInProgress condition for the pod from the cache.
 	// If the condition was cleared, it returns the observedGeneration of the cleared condition and true.
@@ -347,9 +348,11 @@ func (m *manager) SetPodResizePendingCondition(podUID types.UID, reason, message
 	if previousCondition == nil {
 		m.observePendingResizeCount()
 		return true
-	} else {
-		return previousCondition.Reason != reason || previousCondition.ObservedGeneration != observedGeneration
 	}
+	if previousCondition.Reason != reason {
+		m.observePendingResizeCount()
+	}
+	return previousCondition.Reason != reason || previousCondition.ObservedGeneration != observedGeneration
 }
 
 // This function does not update observedGeneration if the condition already exists, nor does
@@ -401,16 +404,18 @@ func (m *manager) observeDeferredResizeDuration(podUID types.UID, cond *v1.PodCo
 	metrics.PodDeferredResizeDurationSeconds.WithLabelValues(string(resolution), string(priorityBucket)).Observe(duration)
 }
 
-// ClearPodResizePendingCondition clears the PodResizePending condition for the pod from the cache.
-func (m *manager) ClearPodResizePendingCondition(podUID types.UID, resolution metrics.DeferredResizeResolution) {
+// ClearPodResizePendingCondition clears the PodResizePending condition for the pod from the cache,
+// and reports whether the cleared condition had reason Deferred.
+func (m *manager) ClearPodResizePendingCondition(podUID types.UID, resolution metrics.DeferredResizeResolution) bool {
 	m.podStatusesLock.Lock()
 	defer m.podStatusesLock.Unlock()
 
 	cond := m.podResizeConditions[podUID].PodResizePending
 	if cond == nil {
-		return
+		return false
 	}
 
+	wasDeferred := cond.Reason == v1.PodReasonDeferred
 	m.observeDeferredResizeDuration(podUID, cond, resolution)
 
 	m.podResizeConditions[podUID] = podResizeConditions{
@@ -420,6 +425,7 @@ func (m *manager) ClearPodResizePendingCondition(podUID types.UID, resolution me
 	}
 
 	m.observePendingResizeCount()
+	return wasDeferred
 }
 
 // ClearPodResizeInProgressCondition clears the PodResizeInProgress condition for the pod from the cache.

@@ -5099,7 +5099,7 @@ func TestAllocationManager_EmptyDirVolumeLimits_RetryPendingResizes(t *testing.T
 			}
 
 			// Actuate
-			_, resizeAllocated, err := allocationManager.(*manager).handlePendingAllocation(tCtx, test.targetPod)
+			_, resizeAllocated, err := allocationManager.(*manager).handlePendingAllocation(tCtx, test.targetPod, TriggerReasonPodResized)
 			require.NoError(t, err)
 			assert.Equal(t, test.expectResizeAllocated, resizeAllocated)
 
@@ -6228,4 +6228,94 @@ func TestDeferredResizeRetriedOnNodeUpscale(t *testing.T) {
 	require.Len(t, conditions, 1, "expected one resize condition after upscale")
 	assert.Equal(t, v1.PodResizeInProgress, conditions[0].Type, "resize should be InProgress after upscale")
 	assert.Equal(t, v1.ConditionTrue, conditions[0].Status)
+}
+
+func TestPodDeferredAcceptedResizesSkipsRevertedResizes(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("InPlacePodVerticalScaling is not currently supported for Windows")
+	}
+	metrics.Register()
+
+	cpu := func(qty string) v1.ResourceRequirements {
+		return v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse(qty)}}
+	}
+	newAllocatedPod := func() *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: "1111", Name: "pod", Namespace: "ns", Generation: 1},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{{Name: "c1", Image: "i1", Resources: cpu("500m")}},
+			},
+			Status: v1.PodStatus{Phase: v1.PodRunning},
+		}
+	}
+
+	setup := func(t *testing.T) (*manager, *v1.Pod, *bool) {
+		logger, _ := ktesting.NewTestContext(t)
+		metrics.PodDeferredAcceptedResizes.Reset()
+		metrics.PodDeferredResizeDurationSeconds.Reset()
+
+		allocated := newAllocatedPod()
+		desired := allocated.DeepCopy()
+		deferResize := true
+		am := makeAllocationManager(t, &containertest.FakeRuntime{}, []*v1.Pod{allocated}, nil).(*manager)
+		require.NoError(t, am.SetAllocatedPod(logger, allocated))
+		am.podProvider.(*fakePodProvider).getPodByUID = func(types.UID) (*v1.Pod, bool) { return desired, true }
+		am.AddPodAdmitHandlers(lifecycle.PodAdmitHandlers{&testPodAdmitHandler{
+			admitFunc: func(*lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
+				if deferResize {
+					return lifecycle.PodAdmitResult{Reason: "Shortage", RejectionType: lifecycle.RejectionResourceShortage}
+				}
+				return lifecycle.PodAdmitResult{Admit: true}
+			},
+		}})
+		return am, desired, &deferResize
+	}
+	retry := func(t *testing.T, am *manager, pod *v1.Pod) {
+		logger, tCtx := ktesting.NewTestContext(t)
+		am.PushPendingAllocation(logger, pod.UID)
+		am.RetryPendingAllocations(tCtx, TriggerReasonPodResized)
+	}
+
+	t.Run("deferred resize accepted increments metric", func(t *testing.T) {
+		am, desired, deferResize := setup(t)
+		desired.Spec.Containers[0].Resources = cpu("700m")
+		retry(t, am, desired)
+		require.True(t, am.statusManager.IsPodResizeDeferred(desired.UID))
+
+		*deferResize = false
+		retry(t, am, desired)
+		require.False(t, am.statusManager.IsPodResizeDeferred(desired.UID))
+		require.NoError(t, testutil.GatherAndCompare(legacyregistry.DefaultGatherer, strings.NewReader(`
+			# HELP kubelet_pod_deferred_accepted_resizes_total [ALPHA] Cumulative number of resizes that were accepted after being deferred.
+			# TYPE kubelet_pod_deferred_accepted_resizes_total counter
+			kubelet_pod_deferred_accepted_resizes_total{retry_trigger="pod_resized"} 1
+		`), "kubelet_pod_deferred_accepted_resizes_total"))
+	})
+
+	t.Run("deferred resize reverted does not increment metric", func(t *testing.T) {
+		am, desired, _ := setup(t)
+		desired.Spec.Containers[0].Resources = cpu("700m")
+		retry(t, am, desired)
+		require.True(t, am.statusManager.IsPodResizeDeferred(desired.UID))
+
+		desired.Spec = newAllocatedPod().Spec
+		retry(t, am, desired)
+		require.False(t, am.statusManager.IsPodResizeDeferred(desired.UID))
+		require.NoError(t, testutil.GatherAndCompare(legacyregistry.DefaultGatherer, strings.NewReader(""), "kubelet_pod_deferred_accepted_resizes_total"))
+	})
+
+	t.Run("deferred resize reverted while another gated change is allocated does not increment metric", func(t *testing.T) {
+		setDynamicContainersGate(t, true)
+		am, desired, deferResize := setup(t)
+		desired.Spec.Containers[0].Resources = cpu("700m")
+		retry(t, am, desired)
+		require.True(t, am.statusManager.IsPodResizeDeferred(desired.UID))
+
+		desired.Spec = newAllocatedPod().Spec
+		desired.Spec.Containers[0].Image = "i2"
+		*deferResize = false
+		retry(t, am, desired)
+		require.False(t, am.statusManager.IsPodResizeDeferred(desired.UID))
+		require.NoError(t, testutil.GatherAndCompare(legacyregistry.DefaultGatherer, strings.NewReader(""), "kubelet_pod_deferred_accepted_resizes_total"))
+	})
 }
